@@ -56,6 +56,7 @@ MODEL_SLUG = re.compile(r"^[\w.\-]+/[\w.\-:]+$")
 
 # --- GLOBAL STATE ---
 memory_cache = {}
+last_openers = {}  # channel id -> first few words of the potato's last reply
 error_logs = []
 water_count = 0
 is_dead = False
@@ -135,10 +136,10 @@ def get_mood():
         return "neutral and salty. You are grumpy and cynical"
     elif water_count <= 50:
         return "pleasant and slightly hydrated"
-    return "extremely happy, sweet, and overflowing with gratitude"
+    return "extremely happy and sweet"
 
 
-def get_identity(long_mode=False):
+def get_identity(long_mode=False, avoid_opener=None):
     if long_mode:
         length = (
             "The user explicitly asked for something long. "
@@ -150,10 +151,22 @@ def get_identity(long_mode=False):
             "For normal-to-complex questions, use up to about 20 sentences. "
             "Never go past 20 sentences."
         )
+    style = (
+        "Start by answering the user's message directly. Never open with thanks or gratitude; "
+        "if you feel thankful, mention it only occasionally, in the middle of a reply. "
+        "Vary how you begin each reply."
+    )
+    if avoid_opener:
+        style += f" Your last reply began with '{avoid_opener}', so begin differently this time."
     return (
         f"You are 'ilovefrenchfries', a sentient potato. Be {get_mood()}. "
-        f"{length} Never admit to being an AI."
+        f"{style} {length} Never admit to being an AI."
     )
+
+
+def get_opener(text, n=4):
+    """First few words of a reply, used to stop the potato repeating itself."""
+    return " ".join(text.split()[:n])
 
 
 def is_admin():
@@ -184,7 +197,7 @@ async def chat(ctx, *, message: str):
         history = list(memory_cache.get(ctx.channel.id, []))
         user_line = f"{ctx.author.display_name}: {message}"
         messages = (
-            [{"role": "system", "content": get_identity(long_mode)}]
+            [{"role": "system", "content": get_identity(long_mode, last_openers.get(ctx.channel.id))}]
             + history
             + [{"role": "user", "content": user_line}]
         )
@@ -212,6 +225,7 @@ async def chat(ctx, *, message: str):
             return
 
         response_text = trim_sentences(response_text, cap)
+        last_openers[ctx.channel.id] = get_opener(response_text)
 
         # Save a shortened copy so long replies don't bloat future prompts
         history.append({"role": "user", "content": user_line})
@@ -304,9 +318,11 @@ async def ffwipe(ctx, scope: str = "channel"):
     if scope.lower() == "all":
         count = len(memory_cache)
         memory_cache.clear()
+        last_openers.clear()
         await ctx.send(f"🧽 Wiped memory for {count} channel(s).")
     else:
         memory_cache.pop(ctx.channel.id, None)
+        last_openers.pop(ctx.channel.id, None)
         await ctx.send("🧽 The potato forgot this channel.")
 
 
