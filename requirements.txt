@@ -2,3 +2,5 @@ discord.py
 openai
 python-dotenv
 psutil
+yt-dlp
+pynacl
