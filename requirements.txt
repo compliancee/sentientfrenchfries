@@ -5,3 +5,4 @@ psutil
 yt-dlp
 pynacl
 dave.py
+davey
