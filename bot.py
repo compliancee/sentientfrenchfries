@@ -5,7 +5,6 @@ import time
 import random
 import shutil
 import asyncio
-import tempfile
 import threading
 from collections import deque
 from dataclasses import dataclass, field
@@ -24,24 +23,16 @@ try:
     import yt_dlp
 except ImportError:  # chat keeps working; music replies with a clear error instead
     yt_dlp = None
-import os
 
-#Tự động tạo file cookies.txt trên server Render khi bot khởi động
-if os.getenv("YTDLP_COOKIES"):
-    with open("cookies.txt", "w", encoding="utf-8") as f:
-        f.write(os.getenv("YTDLP_COOKIES"))
+try:
+    import spotipy
+    from spotipy.oauth2 import SpotifyClientCredentials
+except ImportError:  # Spotify links fall back to the public embed-page reader
+    spotipy = None
+    SpotifyClientCredentials = None
 
-YTDL_OPTIONS = {
-    'format': 'bestaudio/best',
-    'noplaylist': True,
-    'quiet': True,
-    'nocheckcertificate': True,
-    'source_address': '0.0.0.0',
-    # Bảo yt-dlp dùng file cookies vừa tạo
-    'cookiefile': 'cookies.txt' if os.path.exists("cookies.txt") else None
-}
 # --- CONFIG & ENVIRONMENT ---
-load_dotenv()
+load_dotenv()  # must run BEFORE any os.getenv below so a local .env works too
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
@@ -49,9 +40,13 @@ PORT = int(os.getenv("PORT", 10000))  # Render default
 
 # Optional extras (all safe to leave unset):
 GUILD_ID = int(os.getenv("GUILD_ID", 0))     # sync slash commands instantly to ONE server (handy for testing)
-YTDLP_COOKIES = os.getenv("YTDLP_COOKIES")   # path to a cookies.txt; helps when YouTube blocks the host's IP
 YTDLP_PROXY = os.getenv("YTDLP_PROXY")       # proxy URL used by yt-dlp
 FFMPEG_PATH = os.getenv("FFMPEG_PATH")       # custom ffmpeg location
+SPOTIPY_CLIENT_ID = os.getenv("SPOTIPY_CLIENT_ID")
+SPOTIPY_CLIENT_SECRET = os.getenv("SPOTIPY_CLIENT_SECRET")
+
+# Should the bot's replies ping the person it is replying to? (the reply itself is always shown)
+REPLY_PING = False
 
 # --- RESPONSE LENGTH SETTINGS ---
 # The prompt asks for ~6 sentences (simple) or ~20 (normal/complex).
@@ -108,29 +103,81 @@ FFMPEG_EXE = find_ffmpeg()
 FFMPEG_BEFORE = "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 FFMPEG_OPTIONS = "-vn -compression_level 5"
 
-# yt-dlp rewrites its cookie file; secret-file mounts are read-only, so work on a copy.
-COOKIE_FILE = None
-if YTDLP_COOKIES and os.path.isfile(YTDLP_COOKIES):
-    try:
-        COOKIE_FILE = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-        shutil.copyfile(YTDLP_COOKIES, COOKIE_FILE)
-    except OSError:
-        COOKIE_FILE = YTDLP_COOKIES
 
-YTDL_OPTS = {
+# =============================================================================
+#  YOUTUBE COOKIES  (REQUIREMENT 1)
+#  Runs at import time, before yt-dlp is ever used.
+# =============================================================================
+COOKIE_PATH = os.path.abspath("cookies.txt")
+
+
+def _normalise_cookie_text(raw):
+    """Repair the usual damage done to a cookies.txt pasted into an env-var box."""
+    raw = raw.strip().strip('"').strip("'")
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    if "\n" not in raw and "\\n" in raw:      # newlines were flattened into a literal \n
+        raw = raw.replace("\\n", "\n")
+
+    lines = []
+    for line in raw.split("\n"):
+        line = line.rstrip()
+        if not line:
+            continue
+        is_comment = line.startswith("#") and not line.startswith("#HttpOnly_")
+        if not is_comment and "\t" not in line:   # tabs were turned into spaces: Netscape needs real tabs
+            parts = line.split(None, 6)
+            if len(parts) == 7:
+                line = "\t".join(parts)
+        lines.append(line)
+
+    if not lines or not lines[0].startswith("# Netscape HTTP Cookie File"):
+        lines.insert(0, "# Netscape HTTP Cookie File")
+    return "\n".join(lines) + "\n"
+
+
+def setup_cookies():
+    """Write YOUTUBE_COOKIES (or YTDLP_COOKIES) to cookies.txt. Returns True if the file exists afterwards."""
+    raw = os.getenv("YOUTUBE_COOKIES") or os.getenv("YTDLP_COOKIES")
+    if not raw:
+        return os.path.exists(COOKIE_PATH)
+    raw = raw.strip()
+    # YTDLP_COOKIES used to hold a *path* to a cookie file; keep supporting that.
+    if "\n" not in raw and len(raw) < 500 and os.path.isfile(raw):
+        try:
+            with open(raw, "r", encoding="utf-8") as f:
+                raw = f.read()
+        except OSError as e:
+            print(f"⚠️ Couldn't read cookie file '{raw}': {e}")
+            return os.path.exists(COOKIE_PATH)
+    text = _normalise_cookie_text(raw)
+    with open(COOKIE_PATH, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    count = sum(1 for ln in text.split("\n") if ln and (not ln.startswith("#") or ln.startswith("#HttpOnly_")))
+    print(f"🍪 Wrote {COOKIE_PATH} ({count} cookie lines)")
+    if "youtube.com" not in text:
+        print("⚠️ cookies.txt has no youtube.com entries — was it exported from a logged-in YouTube tab?")
+    return True
+
+
+HAVE_COOKIES = setup_cookies()
+
+YTDL_OPTIONS = {
     "format": "bestaudio/best",
     "noplaylist": True,                              # a video link with &list=... plays just that video
     "quiet": True,
     "no_warnings": True,
+    "nocheckcertificate": True,
     "source_address": "0.0.0.0",                     # IPv4 only: YouTube stream URLs are tied to the requesting IP
     "socket_timeout": 20,
     "allowed_extractors": ["default", "-generic"],   # known sites only (no "fetch any URL" fallback)
     "js_runtimes": {"deno": {}, "node": {}},         # YouTube needs a JS runtime: Deno, or Node 22+
+    # Fallback clients, tried in order when one is blocked / needs a token:
+    "extractor_args": {"youtube": {"player_client": ["tv", "ios", "mweb"]}},
 }
-if COOKIE_FILE:
-    YTDL_OPTS["cookiefile"] = COOKIE_FILE
+if os.path.exists(COOKIE_PATH):
+    YTDL_OPTIONS["cookiefile"] = COOKIE_PATH
 if YTDLP_PROXY:
-    YTDL_OPTS["proxy"] = YTDLP_PROXY
+    YTDL_OPTIONS["proxy"] = YTDLP_PROXY
 
 # --- ASYNC OPENROUTER SETUP ---
 client = AsyncOpenAI(
@@ -156,6 +203,7 @@ START_TIME = time.time()
 players = {}       # guild id -> MusicPlayer
 join_locks = {}    # guild id -> asyncio.Lock (stops two /play calls connecting at once)
 _session = None    # shared aiohttp session, created on first use
+_spotipy = None    # shared spotipy client, created on first use
 
 # --- DISCORD SETUP ---
 intents = discord.Intents.default()
@@ -187,11 +235,15 @@ bot = PotatoBot(
     command_prefix="!",
     intents=intents,
     help_command=None,
-    allowed_mentions=discord.AllowedMentions.none(),  # blocks @everyone / role pings
+    # blocks @everyone / role pings; replied_user controls the ping on Discord replies
+    allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False, replied_user=REPLY_PING),
 )
 
 
-# --- RENDER HEALTH CHECK SERVER ---
+# =============================================================================
+#  RENDER KEEP-ALIVE SERVER  (REQUIREMENT 3)
+#  Point UptimeRobot at https://<your-service>.onrender.com every 5 minutes.
+# =============================================================================
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def _ok(self):
         self.send_response(200)
@@ -202,7 +254,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self._ok()
         self.wfile.write(b"Potato Node: Online")
 
-    def do_HEAD(self):  # some uptime monitors use HEAD
+    def do_HEAD(self):  # UptimeRobot's free plan uses HEAD requests
         self._ok()
 
     def log_message(self, format, *args):
@@ -210,8 +262,12 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
 
 def run_web_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
-    print(f"🌍 Render Health Check active on port {PORT}")
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+    except OSError as e:
+        print(f"⚠️ Keep-alive server couldn't bind to port {PORT}: {e}")
+        return
+    print(f"🌍 Keep-alive server active on port {PORT}")
     server.serve_forever()
 
 
@@ -221,6 +277,16 @@ def log_error(msg):
     error_logs.append(entry)
     del error_logs[:-50]  # keep only the last 50
     print(f"⚠️ {entry}")
+
+
+async def reply(ctx, content=None, **kwargs):
+    """Answer with Discord's built-in reply feature (falls back to a normal message if the original is gone)."""
+    kwargs.setdefault("mention_author", REPLY_PING)
+    return await ctx.send(
+        content,
+        reference=ctx.message.to_reference(fail_if_not_exists=False),
+        **kwargs,
+    )
 
 
 def trim_sentences(text, limit):
@@ -335,12 +401,22 @@ POTATO_FACTS = [
 ]
 
 
+# =============================================================================
+#  NO DMs  (REQUIREMENT 4)
+#  Prefix commands: a global check that fails outside servers.
+#  Slash commands: every command below carries @app_commands.guild_only().
+# =============================================================================
+@bot.check
+async def block_dms(ctx):
+    return ctx.guild is not None  # CheckFailure -> silently ignored in on_command_error
+
+
 # --- USER COMMANDS ---
 @bot.command(aliases=["c"])
 @commands.cooldown(1, 8, commands.BucketType.user)
 async def chat(ctx, *, message: str):
     if is_dead:
-        await ctx.send("... (The potato is dead.)")
+        await reply(ctx, "... (The potato is dead.)")
         return
 
     long_mode = bool(LONG_PATTERN.search(message))
@@ -378,7 +454,7 @@ async def chat(ctx, *, message: str):
                 log_error(f"{model_id} fail: {type(e).__name__} {str(e)[:100]}")
 
         if not response_text:
-            await ctx.send("The cloud is a desert. Try again in a bit.")
+            await reply(ctx, "The cloud is a desert. Try again in a bit.")
             return
 
         response_text = trim_sentences(response_text, cap)
@@ -389,30 +465,33 @@ async def chat(ctx, *, message: str):
         history.append({"role": "assistant", "content": response_text[:1500]})
         memory_cache[ctx.channel.id] = history[-6:]
 
-        for chunk in split_message(response_text)[:MAX_CHUNKS]:
-            await ctx.send(chunk)
+        for i, chunk in enumerate(split_message(response_text)[:MAX_CHUNKS]):
+            if i == 0:
+                await reply(ctx, chunk)      # first part is a real Discord reply to the asker
+            else:
+                await ctx.send(chunk)        # the rest follows underneath
 
 
 @bot.command()
 async def ffw(ctx):
     global water_count, is_dead
     if is_dead:
-        await ctx.send("You are watering a corpse. It's too late.")
+        await reply(ctx, "You are watering a corpse. It's too late.")
         return
 
     water_count += 1
     if water_count > 100:
         is_dead = True
-        await ctx.send("🌊 **OVERWATERED!** The potato died. 💀")
+        await reply(ctx, "🌊 **OVERWATERED!** The potato died. 💀")
     else:
-        await ctx.send(f"💧 Hydration: `{water_count}/100`.")
+        await reply(ctx, f"💧 Hydration: `{water_count}/100`.")
 
 
 @bot.command()
 async def ffmood(ctx):
-    """NEW: public mood / hydration check."""
+    """Public mood / hydration check."""
     if is_dead:
-        await ctx.send("💀 The potato is dead. Ask an admin to resurrect it.")
+        await reply(ctx, "💀 The potato is dead. Ask an admin to resurrect it.")
         return
     mood = get_mood().split(".")[0]  # "neutral and salty", "pleasant and slightly hydrated", ...
     embed = discord.Embed(
@@ -422,17 +501,17 @@ async def ffmood(ctx):
     )
     embed.add_field(name="💧 Hydration", value=f"`{hydration_bar(water_count)}` {water_count}/100", inline=False)
     embed.set_footer(text="Use !ffw to water it")
-    await ctx.send(embed=embed)
+    await reply(ctx, embed=embed)
 
 
 @bot.command()
 @commands.cooldown(1, 5, commands.BucketType.user)
 async def fffact(ctx):
-    """NEW: random potato fact."""
+    """Random potato fact."""
     if is_dead:
-        await ctx.send("... (The potato is dead. Dead potatoes tell no facts.)")
+        await reply(ctx, "... (The potato is dead. Dead potatoes tell no facts.)")
         return
-    await ctx.send(f"🥔 **Potato fact:** {random.choice(POTATO_FACTS)}")
+    await reply(ctx, f"🥔 **Potato fact:** {random.choice(POTATO_FACTS)}")
 
 
 # --- ADMIN COMMANDS ---
@@ -442,7 +521,7 @@ async def ffrsr(ctx):
     """Resurrect the potato and reset hydration to 0."""
     global water_count, is_dead
     water_count, is_dead = 0, False
-    await ctx.send("🪄 The potato has been resurrected!")
+    await reply(ctx, "🪄 The potato has been resurrected!")
 
 
 @bot.command()
@@ -450,7 +529,7 @@ async def ffrsr(ctx):
 async def logs(ctx):
     """Show the last 5 error entries."""
     out = "\n".join(error_logs[-5:]) or "No errors recorded."
-    await ctx.send(f"📋 **Recent Error Logs:**\n```{out[:1800]}```")
+    await reply(ctx, f"📋 **Recent Error Logs:**\n```{out[:1800]}```")
 
 
 @bot.command()
@@ -469,9 +548,11 @@ async def ffstatus(ctx):
         f"Servers:    {len(bot.guilds)}",
         f"Memories:   {len(memory_cache)} channel(s)",
         f"Errors:     {len(error_logs)} logged",
-        f"Models:     {' > '.join(m.split('/')[-1] for m in HUNT_LIST)}",
+        f"Cookies:    {'loaded' if os.path.exists(COOKIE_PATH) else 'none'}",
+        f"Spotify:    {'spotipy' if _spotipy_configured() else 'embed fallback'}",
+        f"Models:     {' > '.join(x.split('/')[-1] for x in HUNT_LIST)}",
     ]
-    await ctx.send("🥔 **Potato Status**\n```" + "\n".join(lines) + "```")
+    await reply(ctx, "🥔 **Potato Status**\n```" + "\n".join(lines) + "```")
 
 
 @bot.command()
@@ -480,10 +561,10 @@ async def ffsetwater(ctx, amount: int):
     """Set hydration to an exact value (0-100). Also revives the potato."""
     global water_count, is_dead
     if not 0 <= amount <= 100:
-        await ctx.send("Pick a number from 0 to 100.")
+        await reply(ctx, "Pick a number from 0 to 100.")
         return
     water_count, is_dead = amount, False
-    await ctx.send(f"💧 Hydration set to `{water_count}/100`.")
+    await reply(ctx, f"💧 Hydration set to `{water_count}/100`.")
 
 
 @bot.command()
@@ -492,7 +573,7 @@ async def ffkill(ctx):
     """Kill the potato instantly."""
     global is_dead
     is_dead = True
-    await ctx.send("💀 The potato has been... peeled.")
+    await reply(ctx, "💀 The potato has been... peeled.")
 
 
 @bot.command()
@@ -503,11 +584,11 @@ async def ffwipe(ctx, scope: str = "channel"):
         count = len(memory_cache)
         memory_cache.clear()
         last_openers.clear()
-        await ctx.send(f"🧽 Wiped memory for {count} channel(s).")
+        await reply(ctx, f"🧽 Wiped memory for {count} channel(s).")
     else:
         memory_cache.pop(ctx.channel.id, None)
         last_openers.pop(ctx.channel.id, None)
-        await ctx.send("🧽 The potato forgot this channel.")
+        await reply(ctx, "🧽 The potato forgot this channel.")
 
 
 @bot.command()
@@ -516,13 +597,13 @@ async def ffclearlogs(ctx):
     """Clear the error log."""
     count = len(error_logs)
     error_logs.clear()
-    await ctx.send(f"🗑️ Cleared {count} log entr{'y' if count == 1 else 'ies'}.")
+    await reply(ctx, f"🗑️ Cleared {count} log entr{'y' if count == 1 else 'ies'}.")
 
 
 @bot.command()
 @is_admin()
 async def ffsay(ctx, *, text: str):
-    """Make the potato say something (deletes your command message)."""
+    """Make the potato say something (deletes your command message, so this one can't be a reply)."""
     try:
         await ctx.message.delete()
     except (discord.Forbidden, discord.NotFound):
@@ -538,11 +619,11 @@ async def ffmodel(ctx, action: str = "list", model_id: Optional[str] = None):
 
     if action in ("add", "remove", "first"):
         if not model_id or not MODEL_SLUG.match(model_id):
-            await ctx.send(f"Usage: `!ffmodel {action} provider/model-name`")
+            await reply(ctx, f"Usage: `!ffmodel {action} provider/model-name`")
             return
         if action == "add":
             if model_id in HUNT_LIST:
-                await ctx.send("That model is already in the list.")
+                await reply(ctx, "That model is already in the list.")
                 return
             HUNT_LIST.append(model_id)
         elif action == "first":
@@ -551,24 +632,24 @@ async def ffmodel(ctx, action: str = "list", model_id: Optional[str] = None):
             HUNT_LIST.insert(0, model_id)
         else:  # remove
             if model_id not in HUNT_LIST:
-                await ctx.send("That model isn't in the list.")
+                await reply(ctx, "That model isn't in the list.")
                 return
             if len(HUNT_LIST) == 1:
-                await ctx.send("Can't remove the last model.")
+                await reply(ctx, "Can't remove the last model.")
                 return
             HUNT_LIST.remove(model_id)
     elif action == "reset":
         HUNT_LIST[:] = DEFAULT_MODELS
     elif action != "list":
-        await ctx.send("Usage: `!ffmodel [list | add <id> | remove <id> | first <id> | reset]`")
+        await reply(ctx, "Usage: `!ffmodel [list | add <id> | remove <id> | first <id> | reset]`")
         return
 
     listing = "\n".join(f"{i}. {m}" for i, m in enumerate(HUNT_LIST, 1))
-    await ctx.send(f"🧠 **Model order:**\n```{listing}```")
+    await reply(ctx, f"🧠 **Model order:**\n```{listing}```")
 
 
 # =============================================================================
-#  NEW: /cmd and /cmda COMMAND PANELS
+#  /cmd and /cmda COMMAND PANELS
 #  The lists below are what the panels display. When you add a command to the
 #  bot, add a row here too.
 # =============================================================================
@@ -618,17 +699,19 @@ def build_command_panel(title, description, sections):
     for name, rows in sections:
         value = "\n".join(f"`{cmd}` — {desc}" for cmd, desc in rows)
         embed.add_field(name=name, value=value, inline=False)
-    embed.set_footer(text="! = prefix command   •   / = slash command")
+    embed.set_footer(text="! = prefix command   •   / = slash command   •   servers only (no DMs)")
     return embed
 
 
 @bot.tree.command(name="cmd", description="Show everything the potato can do")
+@app_commands.guild_only()
 async def cmd_panel(interaction: discord.Interaction):
     embed = build_command_panel("🥔 Potato Commands", "Here's what you can do:", USER_COMMANDS)
     await interaction.response.send_message(embed=embed, ephemeral=True)  # ephemeral=False to show everyone
 
 
 @bot.tree.command(name="cmda", description="Admin command panel (admins only)")
+@app_commands.guild_only()
 async def cmda_panel(interaction: discord.Interaction):
     if interaction.user.id != ADMIN_ID:
         await interaction.response.send_message("🚫 Admins only.", ephemeral=True)
@@ -638,7 +721,7 @@ async def cmda_panel(interaction: discord.Interaction):
 
 
 # =============================================================================
-#  NEW: MUSIC
+#  MUSIC
 # =============================================================================
 class UserFacingError(Exception):
     """An error whose message is safe to show to Discord users."""
@@ -656,7 +739,8 @@ def explain_error(err):
     if "confirm your age" in low or "age-restricted" in low or "age restricted" in low:
         return "that video is age-restricted."
     if "not a bot" in low or "sign in to confirm" in low:
-        return "YouTube is blocking my server right now (bot check) — the bot owner may need to add cookies."
+        return ("YouTube is blocking my server right now (bot check) — the bot owner may need to "
+                "refresh the cookies (see `!logs`).")
     if any(w in low for w in ("private video", "video unavailable", "not available", "been removed", "deleted")):
         return "that video isn't available."
     return "I couldn't load that."
@@ -675,7 +759,7 @@ def ffmpeg_available():
 
 # ---------- yt-dlp ----------
 def _ytdl_sync(query, flat, limit):
-    opts = dict(YTDL_OPTS)
+    opts = dict(YTDL_OPTIONS)
     opts["playlistend"] = limit
     if flat:
         opts["extract_flat"] = "in_playlist"  # list playlist entries without resolving each one
@@ -738,7 +822,7 @@ class Track:
     requester: str
     link: Optional[str] = None        # page shown in the panel (what the user shared)
     page_url: Optional[str] = None    # page yt-dlp pulls the audio from
-    search: Optional[str] = None      # "Artist - Title": Spotify tracks are matched on YouTube when played
+    search: Optional[str] = None      # "ytsearch:Artist - Title": Spotify tracks are matched on YouTube when played
     duration: Optional[int] = None
     thumbnail: Optional[str] = None
     origin: str = "Web"
@@ -757,7 +841,7 @@ class Track:
             if self.stream_fresh:
                 return
             if not self.page_url:
-                best = await best_youtube_match(self.search or self.title, self.duration)
+                best = await best_youtube_match(self.search or f"ytsearch:{self.title}", self.duration)
                 self.page_url = best["url"]
                 self.thumbnail = self.thumbnail or best.get("thumbnail")
             info = await ytdl_extract(self.page_url, limit=1)
@@ -773,8 +857,9 @@ class Track:
 
 
 async def best_youtube_match(query, expected_seconds):
-    """Search YouTube; for Spotify tracks prefer the result whose length is closest to the original."""
-    info = await ytdl_extract(f"ytsearch5:{query}", flat=True, limit=5)
+    """Search YouTube ('ytsearch:Artist - Title'); prefer the result whose length is closest to the original."""
+    text = re.sub(r"^ytsearch\d*:", "", query).strip()
+    info = await ytdl_extract(f"ytsearch5:{text}", flat=True, limit=5)
     entries = [e for e in ((info or {}).get("entries") or []) if e and entry_url(e)]
     if not entries:
         raise UserFacingError("I couldn't find a YouTube match for that track.")
@@ -804,9 +889,12 @@ def track_from_entry(entry, requester, origin):
     )
 
 
-# ---------- Spotify (no API key: reads the public embed page) ----------
-# Spotify's Web API now needs a Premium-owned developer app and hides most playlist contents,
-# so links are read from the public embed page instead, and each track is matched on YouTube.
+# =============================================================================
+#  SPOTIFY  (REQUIREMENT 2)
+#  1) spotipy (needs SPOTIPY_CLIENT_ID + SPOTIPY_CLIENT_SECRET) -> "ytsearch:Artist - Title"
+#  2) if spotipy isn't configured, or Spotify refuses the request (it restricts
+#     some playlists for new developer apps), fall back to reading the public embed page.
+# =============================================================================
 SPOTIFY_RE = re.compile(
     r"(?:open\.spotify\.com/(?:embed/)?(?:intl-[a-z-]+/)?(?:user/[^/\s]+/)?|spotify:(?:user:[^:\s]+:)?)"
     r"(track|album|playlist)[/:]([A-Za-z0-9]{22})",
@@ -842,6 +930,121 @@ async def expand_spotify_short_link(url):
         return url
 
 
+def make_spotify_track(artists, name, duration, thumb, link, requester):
+    """Build a Track that is matched on YouTube with the query 'ytsearch:Artist - Title' when played."""
+    name = str(name or "").strip()
+    if not name:
+        return None
+    artists = str(artists or "").strip()
+    first_artist = artists.split(",")[0].strip()
+    query = f"{first_artist} - {name}" if first_artist else name
+    return Track(
+        title=f"{artists} - {name}" if artists else name,
+        requester=requester,
+        link=link,
+        search=f"ytsearch:{query}",
+        duration=duration,
+        thumbnail=thumb,
+        origin="Spotify → YouTube",
+    )
+
+
+# ---- spotipy path ----
+def _spotipy_configured():
+    return bool(spotipy and SPOTIPY_CLIENT_ID and SPOTIPY_CLIENT_SECRET)
+
+
+def _spotipy_client():
+    global _spotipy
+    if _spotipy is None and _spotipy_configured():
+        _spotipy = spotipy.Spotify(
+            auth_manager=SpotifyClientCredentials(
+                client_id=SPOTIPY_CLIENT_ID,
+                client_secret=SPOTIPY_CLIENT_SECRET,
+            ),
+            requests_timeout=10,
+            retries=1,
+        )
+    return _spotipy
+
+
+def _sp_artists(item):
+    return ", ".join(a["name"] for a in (item.get("artists") or []) if isinstance(a, dict) and a.get("name"))
+
+
+def _sp_image(obj):
+    images = (obj or {}).get("images") or []
+    return images[0].get("url") if images and isinstance(images[0], dict) else None
+
+
+def _sp_row(item, thumb, sid=None):
+    ms = item.get("duration_ms")
+    link = f"https://open.spotify.com/track/{item.get('id') or sid}" if (item.get("id") or sid) else None
+    return {
+        "artists": _sp_artists(item),
+        "name": item.get("name"),
+        "duration": int(ms / 1000) if isinstance(ms, (int, float)) and ms > 0 else None,
+        "thumb": thumb,
+        "link": link,
+    }
+
+
+def _spotipy_fetch(kind, sid):
+    """Blocking: returns (rows, collection_title). Runs in a worker thread."""
+    sp = _spotipy_client()
+    rows, title = [], None
+
+    if kind == "track":
+        t = sp.track(sid)
+        rows.append(_sp_row(t, _sp_image(t.get("album")), sid))
+        return rows, None
+
+    if kind == "album":
+        album = sp.album(sid)
+        title, thumb = album.get("name"), _sp_image(album)
+        page = album.get("tracks") or {}
+        while page:
+            for t in page.get("items") or []:
+                if t and t.get("name"):
+                    rows.append(_sp_row(t, thumb))
+            if len(rows) >= MAX_PLAYLIST_TRACKS or not page.get("next"):
+                break
+            page = sp.next(page)
+        return rows[:MAX_PLAYLIST_TRACKS], title
+
+    # playlist
+    try:
+        title = (sp.playlist(sid, fields="name") or {}).get("name")
+    except Exception:
+        title = None
+    page = sp.playlist_items(sid, limit=100, additional_types=("track",))
+    while page:
+        for it in page.get("items") or []:
+            t = (it or {}).get("track") or (it or {}).get("item")  # Spotify has been renaming this key
+            if t and t.get("name") and t.get("type", "track") == "track":
+                rows.append(_sp_row(t, _sp_image(t.get("album"))))
+        if len(rows) >= MAX_PLAYLIST_TRACKS or not page.get("next"):
+            break
+        page = sp.next(page)
+    return rows[:MAX_PLAYLIST_TRACKS], title
+
+
+async def resolve_spotify_spotipy(kind, sid, requester):
+    loop = asyncio.get_running_loop()
+    rows, title = await asyncio.wait_for(
+        loop.run_in_executor(None, _spotipy_fetch, kind, sid),
+        timeout=RESOLVE_TIMEOUT,
+    )
+    fallback_link = f"https://open.spotify.com/{kind}/{sid}"
+    tracks = []
+    for r in rows:
+        t = make_spotify_track(r["artists"], r["name"], r["duration"], r["thumb"], r["link"] or fallback_link, requester)
+        if t:
+            tracks.append(t)
+    return tracks, title
+
+
+# ---- embed-page fallback (no API key) ----
 def find_spotify_entity(data, kind, sid):
     """Find the dict describing the requested item anywhere inside the page's JSON (layout-proof)."""
     want = f"spotify:{kind}:{sid}".lower()
@@ -885,7 +1088,7 @@ async def fetch_spotify_entity(kind, sid):
     return entity
 
 
-def spotify_artists(item):
+def _embed_artists(item):
     artists = item.get("artists")
     if isinstance(artists, list):
         names = [a.get("name") for a in artists if isinstance(a, dict) and a.get("name")]
@@ -895,14 +1098,14 @@ def spotify_artists(item):
     return sub.strip() if isinstance(sub, str) else ""
 
 
-def spotify_seconds(item):
+def _embed_seconds(item):
     ms = item.get("duration") or item.get("durationMs") or item.get("duration_ms")
     if isinstance(ms, dict):
         ms = ms.get("totalMilliseconds")
     return int(ms / 1000) if isinstance(ms, (int, float)) and ms > 0 else None
 
 
-def spotify_cover(entity):
+def _embed_cover(entity):
     sources = None
     cover = entity.get("coverArt")
     if isinstance(cover, dict):
@@ -919,49 +1122,48 @@ def spotify_cover(entity):
     return None
 
 
-def spotify_link_from_uri(uri):
+def _link_from_uri(uri):
     m = re.match(r"spotify:(track|album|playlist):([A-Za-z0-9]{22})", uri or "")
     return f"https://open.spotify.com/{m.group(1)}/{m.group(2)}" if m else None
 
 
-def spotify_track(item, requester, thumb, link):
-    name = str(item.get("name") or item.get("title") or "").strip()
-    if not name:
-        return None
-    artists = spotify_artists(item)
-    first_artist = artists.split(",")[0].strip()
-    return Track(
-        title=f"{artists} - {name}" if artists else name,
-        requester=requester,
-        link=link,
-        search=f"{first_artist} - {name}" if first_artist else name,
-        duration=spotify_seconds(item),
-        thumbnail=thumb,
-        origin="Spotify → YouTube",
-    )
-
-
-async def resolve_spotify(kind, sid, requester):
+async def resolve_spotify_embed(kind, sid, requester):
     entity = await fetch_spotify_entity(kind, sid)
     link = f"https://open.spotify.com/{kind}/{sid}"
-    cover = spotify_cover(entity)
+    cover = _embed_cover(entity)
     if kind == "track":
-        track = spotify_track(entity, requester, cover, link)
+        track = make_spotify_track(
+            _embed_artists(entity), entity.get("name") or entity.get("title"),
+            _embed_seconds(entity), cover, link, requester,
+        )
         if not track:
             raise UserFacingError(SPOTIFY_FAIL)
         return [track], None
     tracks = []
     for item in (entity.get("trackList") or [])[:MAX_PLAYLIST_TRACKS]:
         if isinstance(item, dict):
-            t = spotify_track(
-                item, requester, cover if kind == "album" else None,
-                spotify_link_from_uri(item.get("uri")) or link,
+            t = make_spotify_track(
+                _embed_artists(item), item.get("name") or item.get("title"), _embed_seconds(item),
+                cover if kind == "album" else None, _link_from_uri(item.get("uri")) or link, requester,
             )
             if t:
                 tracks.append(t)
     if not tracks:
         raise UserFacingError("That Spotify album/playlist looks empty (or it's private).")
     return tracks, str(entity.get("name") or entity.get("title") or f"Spotify {kind}")
+
+
+async def resolve_spotify(kind, sid, requester):
+    """spotipy first, embed-page reader as the safety net."""
+    if _spotipy_configured():
+        try:
+            tracks, title = await resolve_spotify_spotipy(kind, sid, requester)
+            if tracks:
+                return tracks, title
+            log_error(f"spotipy returned nothing for {kind} {sid}; trying embed fallback")
+        except Exception as e:
+            log_error(f"spotipy {kind} failed: {type(e).__name__} {str(e)[:120]}; trying embed fallback")
+    return await resolve_spotify_embed(kind, sid, requester)
 
 
 # ---------- turning whatever the user typed into tracks ----------
@@ -1461,6 +1663,8 @@ class PlayerView(discord.ui.View):
         self.loop_btn.style = discord.ButtonStyle.secondary if mode == "off" else discord.ButtonStyle.success
 
     async def interaction_check(self, interaction):
+        if interaction.guild is None:  # never act on button presses outside a server
+            return False
         problem = control_error(interaction.guild, interaction.user)
         if problem:
             await interaction.response.send_message(f"❌ {problem}", ephemeral=True)
@@ -1507,7 +1711,7 @@ class PlayerView(discord.ui.View):
         await interaction.response.edit_message(embed=self.player.build_embed(), view=self)
 
 
-# ---------- slash commands ----------
+# ---------- slash commands (slash responses are already shown by Discord as replies to the user) ----------
 @bot.tree.command(name="joinvc", description="Join your voice channel (or the voice channel whose chat you type this in)")
 @app_commands.guild_only()
 async def joinvc_cmd(interaction: discord.Interaction):
@@ -1671,23 +1875,25 @@ async def leave_cmd(interaction: discord.Interaction):
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandOnCooldown):
-        await ctx.send(f"⏳ The potato needs a moment. Try again in {error.retry_after:.0f}s.")
+        await reply(ctx, f"⏳ The potato needs a moment. Try again in {error.retry_after:.0f}s.")
     elif isinstance(error, (commands.CommandNotFound, commands.CheckFailure)):
-        return  # unknown command or non-admin: stay silent
+        return  # unknown command, non-admin, or a DM: stay silent
     elif isinstance(error, commands.MissingRequiredArgument):
         if ctx.command.name == "chat":
-            await ctx.send("Say something to the potato: `!chat hello`")
+            await reply(ctx, "Say something to the potato: `!chat hello`")
         else:
-            await ctx.send(f"Usage: `!{ctx.command.name} <{error.param.name}>`")
+            await reply(ctx, f"Usage: `!{ctx.command.name} <{error.param.name}>`")
     elif isinstance(error, commands.BadArgument):
-        await ctx.send("That value doesn't look right. Check the command and try again.")
+        await reply(ctx, "That value doesn't look right. Check the command and try again.")
     else:
         log_error(f"{ctx.command}: {error!r}")
 
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.CommandOnCooldown):
+    if isinstance(error, app_commands.NoPrivateMessage):
+        msg = "🚫 This bot only works in servers, not in DMs."
+    elif isinstance(error, app_commands.CommandOnCooldown):
         msg = f"⏳ Slow down! Try again in {error.retry_after:.0f}s."
     else:
         name = interaction.command.name if interaction.command else "?"
@@ -1728,13 +1934,25 @@ async def on_ready():
 
 # --- EXECUTION ---
 if __name__ == "__main__":
+    # Keep-alive server first, so Render sees an open port immediately.
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
+
+    if not DISCORD_TOKEN:
+        print("FATAL ERROR: DISCORD_TOKEN is not set.")
+        raise SystemExit(1)
 
     if yt_dlp is None:
         print("⚠️ yt-dlp isn't installed: music commands are disabled (pip install -r requirements.txt)")
     elif not ffmpeg_available():
         print("⚠️ ffmpeg wasn't found: music can't play until it's installed (see requirements.txt / Dockerfile)")
+
+    if not os.path.exists(COOKIE_PATH):
+        print("⚠️ No YouTube cookies found (set YOUTUBE_COOKIES): YouTube will probably block this host.")
+    if spotipy is None:
+        print("ℹ️ spotipy isn't installed: Spotify links use the embed-page fallback (pip install spotipy)")
+    elif not _spotipy_configured():
+        print("ℹ️ SPOTIPY_CLIENT_ID / SPOTIPY_CLIENT_SECRET not set: Spotify links use the embed-page fallback")
 
     try:
         bot.run(DISCORD_TOKEN)
