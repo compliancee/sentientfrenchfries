@@ -6,6 +6,7 @@ import random
 import shutil
 import asyncio
 import threading
+import http.cookiejar
 from collections import deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -159,10 +160,25 @@ def setup_cookies():
     return True
 
 
-HAVE_COOKIES = setup_cookies()
+def cookies_valid():
+    """A malformed cookies.txt makes yt-dlp fail on EVERY site, so check it before handing it over."""
+    if not os.path.exists(COOKIE_PATH):
+        return False
+    try:
+        jar = http.cookiejar.MozillaCookieJar(COOKIE_PATH)
+        jar.load(ignore_discard=True, ignore_expires=True)
+        return True
+    except Exception as e:
+        print(f"⚠️ cookies.txt is not a valid Netscape cookie file, ignoring it: {type(e).__name__} {str(e)[:120]}")
+        return False
+
+
+HAVE_COOKIES = setup_cookies() and cookies_valid()
+PLAYER_CLIENTS = [c.strip() for c in os.getenv("YTDLP_PLAYER_CLIENTS", "tv,ios,mweb").split(",") if c.strip()]
 
 YTDL_OPTIONS = {
-    "format": "bestaudio/best",
+    # Prefer a plain HTTP(S) audio stream (more reliable in ffmpeg than HLS, esp. on SoundCloud), then anything.
+    "format": "bestaudio[protocol^=http][protocol!*=m3u8]/bestaudio/best",
     "noplaylist": True,                              # a video link with &list=... plays just that video
     "quiet": True,
     "no_warnings": True,
@@ -172,9 +188,9 @@ YTDL_OPTIONS = {
     "allowed_extractors": ["default", "-generic"],   # known sites only (no "fetch any URL" fallback)
     "js_runtimes": {"deno": {}, "node": {}},         # YouTube needs a JS runtime: Deno, or Node 22+
     # Fallback clients, tried in order when one is blocked / needs a token:
-    "extractor_args": {"youtube": {"player_client": ["tv", "ios", "mweb"]}},
+    "extractor_args": {"youtube": {"player_client": PLAYER_CLIENTS}},
 }
-if os.path.exists(COOKIE_PATH):
+if HAVE_COOKIES:
     YTDL_OPTIONS["cookiefile"] = COOKIE_PATH
 if YTDLP_PROXY:
     YTDL_OPTIONS["proxy"] = YTDLP_PROXY
@@ -548,7 +564,9 @@ async def ffstatus(ctx):
         f"Servers:    {len(bot.guilds)}",
         f"Memories:   {len(memory_cache)} channel(s)",
         f"Errors:     {len(error_logs)} logged",
-        f"Cookies:    {'loaded' if os.path.exists(COOKIE_PATH) else 'none'}",
+        f"Cookies:    {'loaded' if YTDL_OPTIONS.get('cookiefile') else 'none/invalid'}",
+        f"YouTube:    {youtube_status()}",
+        f"yt-dlp:     {ytdlp_version()}",
         f"Spotify:    {'spotipy' if _spotipy_configured() else 'embed fallback'}",
         f"Models:     {' > '.join(x.split('/')[-1] for x in HUNT_LIST)}",
     ]
@@ -648,6 +666,31 @@ async def ffmodel(ctx, action: str = "list", model_id: Optional[str] = None):
     await reply(ctx, f"🧠 **Model order:**\n```{listing}```")
 
 
+@bot.command()
+@is_admin()
+async def fftest(ctx, *, query: str):
+    """Run a lookup and show the RAW yt-dlp result/error (the fastest way to see why a link fails)."""
+    query = query.strip().strip("<>")
+    is_url = bool(re.match(r"https?://", query, re.IGNORECASE))
+    if is_url:
+        query = await expand_short_link(query)
+    target = query if is_url else f"ytsearch1:{query}"
+    async with ctx.typing():
+        try:
+            info = await ytdl_extract(target, limit=1)
+            if info and info.get("entries"):
+                info = next((e for e in info["entries"] if e), None)
+            info = info or {}
+            await reply(
+                ctx,
+                f"✅ `{info.get('extractor_key')}` · {shorten(info.get('title'), 80)}\n"
+                f"stream url: **{'yes' if pick_stream_url(info) else 'NO'}** · protocol `{info.get('protocol')}` · "
+                f"ext `{info.get('ext')}` · duration `{fmt_duration(info.get('duration'))}`",
+            )
+        except Exception as e:
+            await reply(ctx, f"❌ `{type(e).__name__}` for `{shorten(target, 80)}`\n```{str(e)[:1500]}```")
+
+
 # =============================================================================
 #  /cmd and /cmda COMMAND PANELS
 #  The lists below are what the panels display. When you add a command to the
@@ -687,6 +730,7 @@ ADMIN_COMMANDS = [
         ("!ffstatus", "Full status report"),
         ("!logs", "Show the last 5 error entries"),
         ("!ffclearlogs", "Clear the error log"),
+        ("!fftest <link or search>", "Run a lookup and show the raw yt-dlp result/error"),
     ]),
     ("🛠️ Panels", [
         ("/cmda", "Show this admin panel"),
@@ -758,9 +802,16 @@ def ffmpeg_available():
 
 
 # ---------- yt-dlp ----------
+def is_youtube_target(query):
+    q = str(query).lower()
+    return q.startswith("ytsearch") or "youtube.com" in q or "youtu.be" in q
+
+
 def _ytdl_sync(query, flat, limit):
     opts = dict(YTDL_OPTIONS)
     opts["playlistend"] = limit
+    if not is_youtube_target(query):
+        opts.pop("cookiefile", None)  # YouTube cookies are only for YouTube
     if flat:
         opts["extract_flat"] = "in_playlist"  # list playlist entries without resolving each one
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -835,18 +886,39 @@ class Track:
     def stream_fresh(self):
         return bool(self.stream_url) and (time.time() - self.resolved_at) < STREAM_TTL
 
+    async def _resolve_by_search(self):
+        """Spotify tracks: find a match on YouTube, or on SoundCloud when YouTube is blocking us."""
+        last_error = None
+        for source in music_sources():
+            try:
+                best = await best_match(source, self.search or f"ytsearch:{self.title}", self.duration)
+                info = await ytdl_extract(best["url"], limit=1)
+                if info and info.get("entries"):
+                    info = next((e for e in info["entries"] if e), None)
+                if not pick_stream_url(info):
+                    raise UserFacingError("I couldn't find playable audio for that.")
+                self.page_url = best["url"]
+                self.thumbnail = self.thumbnail or best.get("thumbnail")
+                self.origin = f"Spotify → {source.title()}"
+                return info
+            except Exception as e:
+                last_error = e
+                log_error(f"{source} match for '{shorten(self.title, 40)}': {type(e).__name__} {str(e)[:120]}")
+                if source == "youtube" and is_bot_check(e):
+                    block_youtube()
+        raise last_error or UserFacingError("I couldn't find a playable match for that track.")
+
     async def ensure_stream(self):
         """Look up the direct audio URL (stream URLs expire, so this happens right before playing)."""
         async with self._lock:
             if self.stream_fresh:
                 return
-            if not self.page_url:
-                best = await best_youtube_match(self.search or f"ytsearch:{self.title}", self.duration)
-                self.page_url = best["url"]
-                self.thumbnail = self.thumbnail or best.get("thumbnail")
-            info = await ytdl_extract(self.page_url, limit=1)
-            if info and info.get("entries"):
-                info = next((e for e in info["entries"] if e), None)
+            if self.page_url:
+                info = await ytdl_extract(self.page_url, limit=1)
+                if info and info.get("entries"):
+                    info = next((e for e in info["entries"] if e), None)
+            else:
+                info = await self._resolve_by_search()
             stream = pick_stream_url(info)
             if not stream:
                 raise UserFacingError("I couldn't find playable audio for that.")
@@ -856,13 +928,59 @@ class Track:
             self.thumbnail = self.thumbnail or pick_thumb(info)
 
 
-async def best_youtube_match(query, expected_seconds):
-    """Search YouTube ('ytsearch:Artist - Title'); prefer the result whose length is closest to the original."""
-    text = re.sub(r"^ytsearch\d*:", "", query).strip()
-    info = await ytdl_extract(f"ytsearch5:{text}", flat=True, limit=5)
+# ---- which site Spotify tracks are matched on ----
+# SPOTIFY_SOURCES="youtube,soundcloud" (default) tries YouTube first. Once YouTube answers with the
+# bot check, it is skipped for YOUTUBE_BLOCK_SECONDS so every track doesn't wait for the same failure.
+SPOTIFY_SOURCES = [s for s in (x.strip().lower() for x in os.getenv("SPOTIFY_SOURCES", "youtube,soundcloud").split(","))
+                   if s in ("youtube", "soundcloud")] or ["youtube", "soundcloud"]
+YOUTUBE_BLOCK_SECONDS = 600
+youtube_blocked_until = 0.0
+
+
+def is_bot_check(err):
+    low = str(err).lower()
+    return "not a bot" in low or "sign in to confirm" in low
+
+
+def youtube_blocked():
+    return time.time() < youtube_blocked_until
+
+
+def block_youtube():
+    global youtube_blocked_until
+    if not youtube_blocked():
+        log_error(f"YouTube bot check hit: skipping YouTube for {YOUTUBE_BLOCK_SECONDS // 60} min")
+    youtube_blocked_until = time.time() + YOUTUBE_BLOCK_SECONDS
+
+
+def youtube_status():
+    left = int(youtube_blocked_until - time.time())
+    return f"blocked (retry in {left}s)" if left > 0 else "ok / untested"
+
+
+def ytdlp_version():
+    try:
+        from yt_dlp.version import __version__
+        return __version__
+    except Exception:
+        return "n/a"
+
+
+def music_sources():
+    sources = list(SPOTIFY_SOURCES)
+    if youtube_blocked() and len(sources) > 1:
+        sources = [s for s in sources if s != "youtube"]
+    return sources
+
+
+async def best_match(engine, query, expected_seconds):
+    """Search YouTube or SoundCloud for 'Artist - Title'; prefer the result whose length is closest to the original."""
+    text = re.sub(r"^(?:yt|sc)search\d*:", "", query).strip()
+    prefix = "scsearch5" if engine == "soundcloud" else "ytsearch5"
+    info = await ytdl_extract(f"{prefix}:{text}", flat=True, limit=5)
     entries = [e for e in ((info or {}).get("entries") or []) if e and entry_url(e)]
     if not entries:
-        raise UserFacingError("I couldn't find a YouTube match for that track.")
+        raise UserFacingError(f"I couldn't find a {engine.title()} match for that track.")
     if expected_seconds:
         close = [e for e in entries if e.get("duration") and abs(e["duration"] - expected_seconds) <= 10]
         if close:
@@ -913,9 +1031,22 @@ def is_spotify_host(url):
     return host.endswith("spotify.com") or host.endswith("spotify.link")
 
 
-async def expand_spotify_short_link(url):
-    """spotify.link/xxxx (the mobile 'share' link) -> the real open.spotify.com link."""
+SOUNDCLOUD_SHORT_HOSTS = ("on.soundcloud.com", "soundcloud.app.goo.gl")
+
+
+async def expand_short_link(url):
+    """Mobile 'share' links -> the real link: spotify.link/xxxx and on.soundcloud.com/xxxx."""
     host = (urlparse(url).hostname or "").lower()
+    if host in SOUNDCLOUD_SHORT_HOSTS:
+        try:
+            async with get_session().get(url, headers={"User-Agent": BROWSER_UA}, allow_redirects=True) as r:
+                final = str(r.url)
+            final_host = (urlparse(final).hostname or "").lower()
+            if final_host.endswith("soundcloud.com") and final_host not in SOUNDCLOUD_SHORT_HOSTS:
+                return final
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            pass
+        return url
     if host not in ("spotify.link", "spotify.app.link"):
         return url
     try:
@@ -1177,7 +1308,7 @@ async def resolve_query(query, requester):
     is_url = bool(re.match(r"https?://", query, re.IGNORECASE))
 
     if is_url:
-        query = await expand_spotify_short_link(query)
+        query = await expand_short_link(query)
     spotify = parse_spotify(query)
     if spotify:
         return await resolve_spotify(spotify[0], spotify[1], requester)
