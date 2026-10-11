@@ -4,3 +4,4 @@ python-dotenv
 psutil
 yt-dlp
 pynacl
+dave.py
