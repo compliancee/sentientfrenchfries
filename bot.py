@@ -114,7 +114,9 @@ COOKIE_PATH = os.path.abspath("cookies.txt")
 
 def _normalise_cookie_text(raw):
     """Repair the usual damage done to a cookies.txt pasted into an env-var box."""
-    raw = raw.strip().strip('"').strip("'")
+    raw = raw.strip()
+    if len(raw) > 1 and raw[0] == raw[-1] and raw[0] in "\"'":  # only strip a matching pair of outer quotes
+        raw = raw[1:-1]
     raw = raw.replace("\r\n", "\n").replace("\r", "\n")
     if "\n" not in raw and "\\n" in raw:      # newlines were flattened into a literal \n
         raw = raw.replace("\\n", "\n")
@@ -136,10 +138,17 @@ def _normalise_cookie_text(raw):
     return "\n".join(lines) + "\n"
 
 
+COOKIE_STATUS = "not checked"  # shown by !ffstatus so you can see WHY cookies did or didn't load
+
+
 def setup_cookies():
     """Write YOUTUBE_COOKIES (or YTDLP_COOKIES) to cookies.txt. Returns True if the file exists afterwards."""
+    global COOKIE_STATUS
+    names = [n for n in ("YOUTUBE_COOKIES", "YTDLP_COOKIES") if n in os.environ]
     raw = os.getenv("YOUTUBE_COOKIES") or os.getenv("YTDLP_COOKIES")
     if not raw:
+        COOKIE_STATUS = (f"{' / '.join(names)} is set but EMPTY" if names
+                         else "neither YOUTUBE_COOKIES nor YTDLP_COOKIES is set on this service")
         return os.path.exists(COOKIE_PATH)
     raw = raw.strip()
     # YTDLP_COOKIES used to hold a *path* to a cookie file; keep supporting that.
@@ -155,6 +164,7 @@ def setup_cookies():
         f.write(text)
     count = sum(1 for ln in text.split("\n") if ln and (not ln.startswith("#") or ln.startswith("#HttpOnly_")))
     print(f"🍪 Wrote {COOKIE_PATH} ({count} cookie lines)")
+    COOKIE_STATUS = f"env var read OK: {count} cookie lines" + ("" if "youtube.com" in text else " (NO youtube.com entries)")
     if "youtube.com" not in text:
         print("⚠️ cookies.txt has no youtube.com entries — was it exported from a logged-in YouTube tab?")
     return True
@@ -162,13 +172,16 @@ def setup_cookies():
 
 def cookies_valid():
     """A malformed cookies.txt makes yt-dlp fail on EVERY site, so check it before handing it over."""
+    global COOKIE_STATUS
     if not os.path.exists(COOKIE_PATH):
         return False
     try:
         jar = http.cookiejar.MozillaCookieJar(COOKIE_PATH)
         jar.load(ignore_discard=True, ignore_expires=True)
+        COOKIE_STATUS += " -> file valid"
         return True
     except Exception as e:
+        COOKIE_STATUS += f" -> INVALID file: {type(e).__name__} {str(e)[:100]}"
         print(f"⚠️ cookies.txt is not a valid Netscape cookie file, ignoring it: {type(e).__name__} {str(e)[:120]}")
         return False
 
@@ -565,6 +578,7 @@ async def ffstatus(ctx):
         f"Memories:   {len(memory_cache)} channel(s)",
         f"Errors:     {len(error_logs)} logged",
         f"Cookies:    {'loaded' if YTDL_OPTIONS.get('cookiefile') else 'none/invalid'}",
+        f"CookieInfo: {shorten(COOKIE_STATUS, 150)}",
         f"YouTube:    {youtube_status()}",
         f"yt-dlp:     {ytdlp_version()}",
         f"Spotify:    {'spotipy' if _spotipy_configured() else 'embed fallback'}",
@@ -691,9 +705,11 @@ async def fftest(ctx, *, query: str):
                 await reply(ctx, f"❌ `{type(e).__name__}` while playing the first Spotify track\n```{str(e)[:1500]}```")
         return
     target = query if is_url else f"ytsearch1:{query}"
+    cap = _Capture()
+    cookies_sent = bool(YTDL_OPTIONS.get("cookiefile")) and is_youtube_target(target)
     async with ctx.typing():
         try:
-            info = await ytdl_extract(target, limit=1)
+            info = await ytdl_extract(target, limit=1, capture=cap)
             if info and info.get("entries"):
                 info = next((e for e in info["entries"] if e), None)
             info = info or {}
@@ -701,10 +717,14 @@ async def fftest(ctx, *, query: str):
                 ctx,
                 f"✅ `{info.get('extractor_key')}` · {shorten(info.get('title'), 80)}\n"
                 f"stream url: **{'yes' if pick_stream_url(info) else 'NO'}** · protocol `{info.get('protocol')}` · "
-                f"ext `{info.get('ext')}` · duration `{fmt_duration(info.get('duration'))}`",
+                f"ext `{info.get('ext')}` · duration `{fmt_duration(info.get('duration'))}`\n"
+                f"{cap.summary(cookies_sent)}",
             )
         except Exception as e:
-            await reply(ctx, f"❌ `{type(e).__name__}` for `{shorten(target, 80)}`\n```{str(e)[:1500]}```")
+            await reply(
+                ctx,
+                f"❌ `{type(e).__name__}` for `{shorten(target, 80)}`\n```{str(e)[:900]}```\n{cap.summary(cookies_sent)}",
+            )
 
 
 # =============================================================================
@@ -823,9 +843,37 @@ def is_youtube_target(query):
     return q.startswith("ytsearch") or "youtube.com" in q or "youtu.be" in q
 
 
-def _ytdl_sync(query, flat, limit):
+class _Capture:
+    """Collects yt-dlp's own log lines (incl. warnings, normally hidden) for !fftest."""
+
+    def __init__(self):
+        self.lines = []
+
+    def debug(self, msg):
+        if not str(msg).startswith("[debug]"):
+            self.lines.append(str(msg))
+
+    def info(self, msg):
+        self.lines.append(str(msg))
+
+    def warning(self, msg):
+        self.lines.append("WARNING: " + str(msg))
+
+    def error(self, msg):
+        self.lines.append("ERROR: " + str(msg))
+
+    def summary(self, cookies_sent):
+        warns = "\n".join(shorten(ln, 300) for ln in self.lines if ln.startswith("WARNING"))[:700]
+        text = f"cookies sent to yt-dlp: **{'yes' if cookies_sent else 'no'}**"
+        return text + (f"\n```{warns}```" if warns else "")
+
+
+def _ytdl_sync(query, flat, limit, capture=None):
     opts = dict(YTDL_OPTIONS)
     opts["playlistend"] = limit
+    if capture is not None:
+        opts["logger"] = capture
+        opts["no_warnings"] = False
     if not is_youtube_target(query):
         opts.pop("cookiefile", None)  # YouTube cookies are only for YouTube
     if flat:
@@ -834,13 +882,13 @@ def _ytdl_sync(query, flat, limit):
         return ydl.extract_info(query, download=False)
 
 
-async def ytdl_extract(query, *, flat=False, limit=1):
+async def ytdl_extract(query, *, flat=False, limit=1, capture=None):
     """yt-dlp is blocking, so it runs in a worker thread."""
     if yt_dlp is None:
         raise UserFacingError("Music isn't set up on this host (yt-dlp isn't installed).")
     loop = asyncio.get_running_loop()
     return await asyncio.wait_for(
-        loop.run_in_executor(None, _ytdl_sync, query, flat, limit),
+        loop.run_in_executor(None, _ytdl_sync, query, flat, limit, capture),
         timeout=RESOLVE_TIMEOUT,
     )
 
@@ -915,7 +963,11 @@ class Track:
                     raise UserFacingError("I couldn't find playable audio for that.")
                 self.page_url = best["url"]
                 self.thumbnail = self.thumbnail or best.get("thumbnail")
-                self.origin = f"Spotify → {source.title()}"
+                if not self.link:  # plain-text search: take the real title/link from the match
+                    self.link = best["url"]
+                    self.title = info.get("title") or self.title
+                base = self.origin.split(" → ")[0]  # "Spotify", "Search", "YouTube"
+                self.origin = source.title() if base in ("Search", source.title()) else f"{base} → {source.title()}"
                 return info
             except Exception as e:
                 last_error = e
@@ -930,9 +982,19 @@ class Track:
             if self.stream_fresh:
                 return
             if self.page_url:
-                info = await ytdl_extract(self.page_url, limit=1)
-                if info and info.get("entries"):
-                    info = next((e for e in info["entries"] if e), None)
+                try:
+                    info = await ytdl_extract(self.page_url, limit=1)
+                    if info and info.get("entries"):
+                        info = next((e for e in info["entries"] if e), None)
+                except Exception as e:
+                    if not (is_bot_check(e) and is_youtube_target(self.page_url)):
+                        raise
+                    block_youtube()
+                    title = await youtube_title(self.page_url)
+                    if not title or "soundcloud" not in SPOTIFY_SOURCES:
+                        raise
+                    self.search, self.page_url = f"ytsearch:{title}", None
+                    info = await self._resolve_by_search()
             else:
                 info = await self._resolve_by_search()
             stream = pick_stream_url(info)
@@ -980,6 +1042,29 @@ def ytdlp_version():
         return __version__
     except Exception:
         return "n/a"
+
+
+YT_ID_RE = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/)([\w-]{11})")
+
+
+async def youtube_title(url):
+    """Title of a YouTube video via the public oEmbed endpoint (it doesn't trigger the bot check)."""
+    m = YT_ID_RE.search(url or "")
+    if not m:
+        return None
+    watch = f"https://www.youtube.com/watch?v={m.group(1)}"
+    try:
+        async with get_session().get(
+            "https://www.youtube.com/oembed",
+            params={"url": watch, "format": "json"},
+            headers={"User-Agent": BROWSER_UA},
+        ) as r:
+            if r.status != 200:
+                return None
+            data = await r.json(content_type=None)
+        return str(data.get("title") or "").strip() or None
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        return None
 
 
 def music_sources():
@@ -1331,12 +1416,19 @@ async def resolve_query(query, requester):
     if is_url and is_spotify_host(query):
         raise UserFacingError("I can play Spotify **track**, **album** and **playlist** links (not artists or podcasts).")
 
-    target = query if is_url else f"ytsearch1:{query}"
+    if not is_url:  # plain text: matched when the track is about to play (YouTube, else SoundCloud)
+        return [Track(title=shorten(query, 100), requester=requester, search=f"ytsearch:{query}", origin="Search")], None
     try:
-        info = await ytdl_extract(target, flat=True, limit=MAX_PLAYLIST_TRACKS if is_url else 1)
+        info = await ytdl_extract(query, flat=True, limit=MAX_PLAYLIST_TRACKS)
     except UserFacingError:
         raise
     except Exception as e:
+        if is_bot_check(e) and is_youtube_target(query):
+            block_youtube()
+            title = await youtube_title(query)
+            if title and "soundcloud" in SPOTIFY_SOURCES:  # YouTube link blocked: play the same song from SoundCloud
+                return [Track(title=title, requester=requester, link=query,
+                              search=f"ytsearch:{title}", origin="YouTube")], None
         log_error(f"lookup '{shorten(query, 50)}': {type(e).__name__} {str(e)[:150]}")
         raise UserFacingError(f"Sorry, {explain_error(e)}")
     if not info:
