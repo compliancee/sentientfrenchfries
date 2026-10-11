@@ -1,11 +1,15 @@
 import os
 import re
+import sys
 import json
 import time
+import shlex
 import random
 import shutil
 import asyncio
+import tempfile
 import threading
+import subprocess
 import http.cookiejar
 from collections import deque
 from dataclasses import dataclass, field
@@ -20,6 +24,36 @@ from discord.ext import commands
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
+load_dotenv()  # first thing, so a local .env also controls every setting below
+
+
+# =============================================================================
+#  KEEP yt-dlp FRESH  (YouTube changes its player every few weeks and old yt-dlp
+#  versions simply stop working, so the bot updates yt-dlp each time it starts.)
+#  YTDLP_AUTO_UPDATE = 1 (default: latest stable) | nightly | 0 (never)
+#  Must run BEFORE `import yt_dlp` below.
+# =============================================================================
+def maybe_update_ytdlp():
+    mode = (os.getenv("YTDLP_AUTO_UPDATE") or "1").strip().lower()
+    if mode in ("0", "false", "no", "off"):
+        return
+    cmd = [sys.executable, "-m", "pip", "install", "-U", "--quiet", "--disable-pip-version-check"]
+    if mode == "nightly":
+        cmd.append("--pre")
+    cmd.append("yt-dlp[default]")  # [default] also pulls the matching yt-dlp-ejs (YouTube challenge solver)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if result.returncode == 0:
+            print(f"⬆️ yt-dlp is up to date ({mode} channel)")
+        else:
+            print(f"⚠️ yt-dlp update failed, using the installed version: {result.stderr.strip()[-200:]}")
+    except Exception as e:
+        print(f"⚠️ yt-dlp update skipped: {type(e).__name__} {str(e)[:100]}")
+
+
+if __name__ == "__main__":
+    maybe_update_ytdlp()
+
 try:
     import yt_dlp
 except ImportError:  # chat keeps working; music replies with a clear error instead
@@ -33,7 +67,6 @@ except ImportError:  # Spotify links fall back to the public embed-page reader
     SpotifyClientCredentials = None
 
 # --- CONFIG & ENVIRONMENT ---
-load_dotenv()  # must run BEFORE any os.getenv below so a local .env works too
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
@@ -103,10 +136,72 @@ FFMPEG_EXE = find_ffmpeg()
 # ffmpeg encodes straight to Opus, so no system libopus is needed.
 FFMPEG_BEFORE = "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 FFMPEG_OPTIONS = "-vn -compression_level 5"
+# Headers yt-dlp says a stream needs (YouTube ties stream URLs to the client's User-Agent, and
+# rejects ffmpeg's default one with HTTP 403 for some clients).
+FFMPEG_HEADER_NAMES = ("user-agent", "referer", "origin", "accept-language")
+
+
+def ffmpeg_before(headers=None):
+    """Input options for ffmpeg: reconnect flags + the HTTP headers yt-dlp wants us to send."""
+    opts = FFMPEG_BEFORE
+    if headers:
+        text = "".join(f"{k}: {v}\r\n" for k, v in headers.items() if str(k).lower() in FFMPEG_HEADER_NAMES and v)
+        if text:
+            opts += " -headers " + shlex.quote(text)
+    return opts
 
 
 # =============================================================================
-#  YOUTUBE COOKIES  (REQUIREMENT 1)
+#  JAVASCRIPT RUNTIME FOR YOUTUBE
+#  Since late 2025 yt-dlp can only read YouTube if a JS runtime (Deno 2.3+ or Node 22+) is installed.
+#  Without one, every YouTube lookup ends in "Requested format is not available".
+#  `pip install deno` (in requirements.txt) gives you Deno without root access or Docker.
+# =============================================================================
+def _tool_version(path):
+    try:
+        r = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10)
+        return (r.stdout or r.stderr or "").strip()
+    except Exception:
+        return ""
+
+
+def detect_js_runtime():
+    """Returns (js_runtimes setting for yt-dlp, human readable status)."""
+    problems = []
+    deno_paths = [shutil.which("deno"), os.path.join(os.path.dirname(sys.executable), "deno")]
+    try:  # the `deno` pip package
+        import deno
+
+        deno_paths.append(deno.find_deno_bin())
+    except Exception:
+        pass
+    for path in dict.fromkeys(p for p in deno_paths if p):
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            m = re.search(r"deno (\d+)\.(\d+)", _tool_version(path))
+            if m and (int(m[1]), int(m[2])) >= (2, 3):
+                return {"deno": {"path": path}}, f"deno {m[1]}.{m[2]}"
+            problems.append(f"deno {m[1] + '.' + m[2] if m else '?'} is too old (2.3+ needed)")
+    node = shutil.which("node")
+    if node:
+        m = re.search(r"v(\d+)\.", _tool_version(node))
+        if m and int(m[1]) >= 22:
+            return {"node": {"path": node}}, f"node v{m[1]}"
+        problems.append(f"node v{m[1] if m else '?'} is too old (22+ needed)")
+    detail = "; ".join(problems) or "none installed"
+    return {"deno": {}, "node": {}}, f"MISSING ({detail}) - add `deno` to requirements.txt"
+
+
+JS_RUNTIMES, JS_STATUS = detect_js_runtime()
+
+
+def ejs_installed():
+    import importlib.util
+
+    return importlib.util.find_spec("yt_dlp_ejs") is not None
+
+
+# =============================================================================
+#  YOUTUBE COOKIES
 #  Runs at import time, before yt-dlp is ever used.
 # =============================================================================
 COOKIE_PATH = os.path.abspath("cookies.txt")
@@ -187,7 +282,11 @@ def cookies_valid():
 
 
 HAVE_COOKIES = setup_cookies() and cookies_valid()
-PLAYER_CLIENTS = [c.strip() for c in os.getenv("YTDLP_PLAYER_CLIENTS", "tv,ios,mweb").split(",") if c.strip()]
+
+# Leave this EMPTY unless you know what you're doing: yt-dlp picks the YouTube player clients that currently
+# work and changes that list every few weeks. Forcing a fixed list (e.g. "tv,ios,mweb") means using clients that
+# need PO tokens / SABR, so every video fails. Opt-in override: YTDLP_PLAYER_CLIENTS="web_safari,tv_downgraded"
+PLAYER_CLIENTS = [c.strip() for c in os.getenv("YTDLP_PLAYER_CLIENTS", "").split(",") if c.strip()]
 
 YTDL_OPTIONS = {
     # Prefer a plain HTTP(S) audio stream (more reliable in ffmpeg than HLS, esp. on SoundCloud), then anything.
@@ -199,10 +298,10 @@ YTDL_OPTIONS = {
     "source_address": "0.0.0.0",                     # IPv4 only: YouTube stream URLs are tied to the requesting IP
     "socket_timeout": 20,
     "allowed_extractors": ["default", "-generic"],   # known sites only (no "fetch any URL" fallback)
-    "js_runtimes": {"deno": {}, "node": {}},         # YouTube needs a JS runtime: Deno, or Node 22+
-    # Fallback clients, tried in order when one is blocked / needs a token:
-    "extractor_args": {"youtube": {"player_client": PLAYER_CLIENTS}},
+    "js_runtimes": JS_RUNTIMES,                      # detected above (Deno 2.3+ or Node 22+)
 }
+if PLAYER_CLIENTS:
+    YTDL_OPTIONS["extractor_args"] = {"youtube": {"player_client": PLAYER_CLIENTS}}
 if HAVE_COOKIES:
     YTDL_OPTIONS["cookiefile"] = COOKIE_PATH
 if YTDLP_PROXY:
@@ -233,6 +332,7 @@ players = {}       # guild id -> MusicPlayer
 join_locks = {}    # guild id -> asyncio.Lock (stops two /play calls connecting at once)
 _session = None    # shared aiohttp session, created on first use
 _spotipy = None    # shared spotipy client, created on first use
+_YTDL_LOCK = threading.Lock()  # one yt-dlp call at a time: each call rewrites cookies.txt when it finishes
 
 # --- DISCORD SETUP ---
 intents = discord.Intents.default()
@@ -270,7 +370,7 @@ bot = PotatoBot(
 
 
 # =============================================================================
-#  RENDER KEEP-ALIVE SERVER  (REQUIREMENT 3)
+#  RENDER KEEP-ALIVE SERVER
 #  Point UptimeRobot at https://<your-service>.onrender.com every 5 minutes.
 # =============================================================================
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -431,7 +531,7 @@ POTATO_FACTS = [
 
 
 # =============================================================================
-#  NO DMs  (REQUIREMENT 4)
+#  NO DMs
 #  Prefix commands: a global check that fails outside servers.
 #  Slash commands: every command below carries @app_commands.guild_only().
 # =============================================================================
@@ -580,7 +680,10 @@ async def ffstatus(ctx):
         f"Cookies:    {'loaded' if YTDL_OPTIONS.get('cookiefile') else 'none/invalid'}",
         f"CookieInfo: {shorten(COOKIE_STATUS, 150)}",
         f"YouTube:    {youtube_status()}",
-        f"yt-dlp:     {ytdlp_version()}",
+        f"yt-dlp:     {ytdlp_version()} (ejs: {'yes' if ejs_installed() else 'NO'})",
+        f"JS runtime: {shorten(JS_STATUS, 120)}",
+        f"Clients:    {', '.join(PLAYER_CLIENTS) or 'yt-dlp default'}",
+        f"ffmpeg:     {'ok' if ffmpeg_available() else 'MISSING'}",
         f"Spotify:    {'spotipy' if _spotipy_configured() else 'embed fallback'}",
         f"Models:     {' > '.join(x.split('/')[-1] for x in HUNT_LIST)}",
     ]
@@ -683,7 +786,8 @@ async def ffmodel(ctx, action: str = "list", model_id: Optional[str] = None):
 @bot.command()
 @is_admin()
 async def fftest(ctx, *, query: str):
-    """Run a lookup and show the RAW yt-dlp result/error (the fastest way to see why a link fails)."""
+    """Run a lookup and show the RAW yt-dlp result/error, then let ffmpeg try to read the stream.
+    Two layers can fail (yt-dlp finding the stream, ffmpeg playing it); this tells you which one."""
     query = query.strip().strip("<>")
     is_url = bool(re.match(r"https?://", query, re.IGNORECASE))
     if is_url:
@@ -694,11 +798,13 @@ async def fftest(ctx, *, query: str):
             try:
                 tracks, title = await resolve_spotify(spotify[0], spotify[1], ctx.author.display_name)
                 t = tracks[0]
-                await t._resolve_by_search()
+                info = await t._resolve_by_search()
+                ok, detail = await probe_stream(pick_stream_url(info), (info or {}).get("http_headers"))
                 await reply(
                     ctx,
                     f"✅ Spotify read OK ({len(tracks)} track(s)). First: **{md_safe(shorten(t.title, 70))}**\n"
                     f"matched on **{t.origin}** → `{shorten(t.page_url, 80)}`\n"
+                    f"ffmpeg read test: {'✅ OK' if ok else '❌ ' + detail}\n"
                     f"YouTube status: {youtube_status()}",
                 )
             except Exception as e:
@@ -713,17 +819,25 @@ async def fftest(ctx, *, query: str):
             if info and info.get("entries"):
                 info = next((e for e in info["entries"] if e), None)
             info = info or {}
+            stream = pick_stream_url(info)
+            probe = ""
+            if stream:
+                ok, detail = await probe_stream(stream, info.get("http_headers"))
+                probe = f"ffmpeg read test: {'✅ OK' if ok else '❌ ' + detail}\n"
             await reply(
                 ctx,
                 f"✅ `{info.get('extractor_key')}` · {shorten(info.get('title'), 80)}\n"
-                f"stream url: **{'yes' if pick_stream_url(info) else 'NO'}** · protocol `{info.get('protocol')}` · "
+                f"stream url: **{'yes' if stream else 'NO'}** · protocol `{info.get('protocol')}` · "
                 f"ext `{info.get('ext')}` · duration `{fmt_duration(info.get('duration'))}`\n"
+                f"{probe}"
+                f"JS runtime: {shorten(JS_STATUS, 80)}\n"
                 f"{cap.summary(cookies_sent)}",
             )
         except Exception as e:
             await reply(
                 ctx,
-                f"❌ `{type(e).__name__}` for `{shorten(target, 80)}`\n```{str(e)[:900]}```\n{cap.summary(cookies_sent)}",
+                f"❌ `{type(e).__name__}` for `{shorten(target, 80)}`\n```{str(e)[:900]}```\n"
+                f"JS runtime: {shorten(JS_STATUS, 80)}\n{cap.summary(cookies_sent)}",
             )
 
 
@@ -766,7 +880,7 @@ ADMIN_COMMANDS = [
         ("!ffstatus", "Full status report"),
         ("!logs", "Show the last 5 error entries"),
         ("!ffclearlogs", "Clear the error log"),
-        ("!fftest <link or search>", "Run a lookup and show the raw yt-dlp result/error"),
+        ("!fftest <link or search>", "Test yt-dlp + ffmpeg on a link and show the raw result/error"),
     ]),
     ("🛠️ Panels", [
         ("/cmda", "Show this admin panel"),
@@ -807,6 +921,20 @@ class UserFacingError(Exception):
     """An error whose message is safe to show to Discord users."""
 
 
+def is_bot_check(err):
+    low = str(err).lower()
+    return "not a bot" in low or "sign in to confirm" in low
+
+
+def is_youtube_failure(err):
+    """True when YouTube itself (not just this one video) is the problem, so trying another site is worthwhile."""
+    low = str(err).lower()
+    return is_bot_check(err) or any(k in low for k in (
+        "requested format is not available", "no video formats", "only images are available",
+        "po token", "po_token", "sabr", "n challenge", "javascript runtime", "http error 403", "drm protected",
+    ))
+
+
 def explain_error(err):
     """Turn an exception into a short sentence that is safe to show in Discord."""
     if isinstance(err, UserFacingError):
@@ -818,9 +946,14 @@ def explain_error(err):
         return "that link isn't supported."
     if "confirm your age" in low or "age-restricted" in low or "age restricted" in low:
         return "that video is age-restricted."
-    if "not a bot" in low or "sign in to confirm" in low:
+    if is_bot_check(err):
         return ("YouTube is blocking my server right now (bot check) — the bot owner may need to "
                 "refresh the cookies (see `!logs`).")
+    if any(k in low for k in ("requested format is not available", "no video formats", "only images are available")):
+        return ("YouTube didn't give me an audio stream for that — yt-dlp is probably outdated or the host has no "
+                "JavaScript runtime (admin: run `!fftest` and check `!ffstatus`).")
+    if "http error 403" in low:
+        return "YouTube refused the request (HTTP 403)."
     if any(w in low for w in ("private video", "video unavailable", "not available", "been removed", "deleted")):
         return "that video isn't available."
     return "I couldn't load that."
@@ -835,6 +968,66 @@ def get_session():
 
 def ffmpeg_available():
     return bool(shutil.which(FFMPEG_EXE) or os.path.isfile(FFMPEG_EXE))
+
+
+# ---------- ffmpeg helpers ----------
+def clean_ffmpeg_error(text):
+    """Short, URL-free version of ffmpeg's stderr (stream URLs are long and signed; don't paste them in chat/logs)."""
+    text = re.sub(r"https?://\S+", "<url>", str(text))
+    return " ".join(text.split())[-220:]
+
+
+def ffmpeg_hint(text):
+    low = str(text).lower()
+    if "403" in low:
+        return "the stream was refused (HTTP 403)"
+    if "404" in low or "410" in low:
+        return "the stream link expired"
+    if "401" in low:
+        return "the stream needs a login"
+    if "connection" in low or "timed out" in low:
+        return "network problem reaching the stream"
+    return None
+
+
+def read_ffmpeg_errors(f):
+    """Read (and close) the temp file ffmpeg's stderr was written to."""
+    try:
+        f.flush()
+        f.seek(0)
+        text = f.read().decode("utf-8", "replace").strip()
+    except Exception:
+        text = ""
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+    return text
+
+
+async def probe_stream(url, headers=None):
+    """Let ffmpeg read 3 seconds of the stream. Returns (ok, short_reason)."""
+    if not url:
+        return False, "no stream url"
+    cmd = [FFMPEG_EXE, "-hide_banner", "-loglevel", "error", *shlex.split(ffmpeg_before(headers)),
+           "-i", url, "-t", "3", "-vn", "-f", "null", "-"]
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        )
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except asyncio.TimeoutError:
+        if proc is not None:
+            proc.kill()
+        return False, "ffmpeg timed out"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:100]}"
+    text = clean_ffmpeg_error(err.decode("utf-8", "replace"))
+    if proc.returncode == 0 and not text:
+        return True, ""
+    return False, text or f"ffmpeg exit code {proc.returncode}"
 
 
 # ---------- yt-dlp ----------
@@ -878,8 +1071,9 @@ def _ytdl_sync(query, flat, limit, capture=None):
         opts.pop("cookiefile", None)  # YouTube cookies are only for YouTube
     if flat:
         opts["extract_flat"] = "in_playlist"  # list playlist entries without resolving each one
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(query, download=False)
+    with _YTDL_LOCK:  # yt-dlp rewrites cookies.txt when it finishes: two at once could corrupt it
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(query, download=False)
 
 
 async def ytdl_extract(query, *, flat=False, limit=1, capture=None):
@@ -942,6 +1136,7 @@ class Track:
     thumbnail: Optional[str] = None
     origin: str = "Web"
     stream_url: Optional[str] = None
+    headers: Optional[dict] = None    # HTTP headers ffmpeg must send with stream_url
     resolved_at: float = 0.0
     retried: bool = False
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
@@ -950,10 +1145,13 @@ class Track:
     def stream_fresh(self):
         return bool(self.stream_url) and (time.time() - self.resolved_at) < STREAM_TTL
 
-    async def _resolve_by_search(self):
-        """Spotify tracks: find a match on YouTube, or on SoundCloud when YouTube is blocking us."""
+    async def _resolve_by_search(self, skip_youtube=False):
+        """Spotify / text-search tracks: find a match on YouTube, or on SoundCloud when YouTube isn't working."""
         last_error = None
-        for source in music_sources():
+        sources = music_sources()
+        if skip_youtube and len(sources) > 1:
+            sources = [s for s in sources if s != "youtube"]
+        for source in sources:
             try:
                 best = await best_match(source, self.search or f"ytsearch:{self.title}", self.duration)
                 info = await ytdl_extract(best["url"], limit=1)
@@ -987,20 +1185,24 @@ class Track:
                     if info and info.get("entries"):
                         info = next((e for e in info["entries"] if e), None)
                 except Exception as e:
-                    if not (is_bot_check(e) and is_youtube_target(self.page_url)):
+                    # YouTube itself isn't working (bot check, no formats, 403...): play the same song from SoundCloud.
+                    if not (is_youtube_target(self.page_url) and is_youtube_failure(e)):
                         raise
-                    block_youtube()
+                    if is_bot_check(e):
+                        block_youtube()
+                    log_error(f"YouTube extract failed, trying SoundCloud: {type(e).__name__} {str(e)[:120]}")
                     title = await youtube_title(self.page_url)
                     if not title or "soundcloud" not in SPOTIFY_SOURCES:
                         raise
                     self.search, self.page_url = f"ytsearch:{title}", None
-                    info = await self._resolve_by_search()
+                    info = await self._resolve_by_search(skip_youtube=True)
             else:
                 info = await self._resolve_by_search()
             stream = pick_stream_url(info)
             if not stream:
                 raise UserFacingError("I couldn't find playable audio for that.")
             self.stream_url = stream
+            self.headers = (info or {}).get("http_headers")
             self.resolved_at = time.time()
             self.duration = self.duration or info.get("duration")
             self.thumbnail = self.thumbnail or pick_thumb(info)
@@ -1013,11 +1215,6 @@ SPOTIFY_SOURCES = [s for s in (x.strip().lower() for x in os.getenv("SPOTIFY_SOU
                    if s in ("youtube", "soundcloud")] or ["youtube", "soundcloud"]
 YOUTUBE_BLOCK_SECONDS = 600
 youtube_blocked_until = 0.0
-
-
-def is_bot_check(err):
-    low = str(err).lower()
-    return "not a bot" in low or "sign in to confirm" in low
 
 
 def youtube_blocked():
@@ -1109,7 +1306,7 @@ def track_from_entry(entry, requester, origin):
 
 
 # =============================================================================
-#  SPOTIFY  (REQUIREMENT 2)
+#  SPOTIFY
 #  1) spotipy (needs SPOTIPY_CLIENT_ID + SPOTIPY_CLIENT_SECRET) -> "ytsearch:Artist - Title"
 #  2) if spotipy isn't configured, or Spotify refuses the request (it restricts
 #     some playlists for new developer apps), fall back to reading the public embed page.
@@ -1423,13 +1620,14 @@ async def resolve_query(query, requester):
     except UserFacingError:
         raise
     except Exception as e:
-        if is_bot_check(e) and is_youtube_target(query):
-            block_youtube()
+        log_error(f"lookup '{shorten(query, 50)}': {type(e).__name__} {str(e)[:150]}")
+        if is_youtube_target(query) and is_youtube_failure(e):
+            if is_bot_check(e):
+                block_youtube()
             title = await youtube_title(query)
-            if title and "soundcloud" in SPOTIFY_SOURCES:  # YouTube link blocked: play the same song from SoundCloud
+            if title and "soundcloud" in SPOTIFY_SOURCES:  # YouTube isn't working: play the same song from SoundCloud
                 return [Track(title=title, requester=requester, link=query,
                               search=f"ytsearch:{title}", origin="YouTube")], None
-        log_error(f"lookup '{shorten(query, 50)}': {type(e).__name__} {str(e)[:150]}")
         raise UserFacingError(f"Sorry, {explain_error(e)}")
     if not info:
         raise UserFacingError("I couldn't find anything for that.")
@@ -1450,6 +1648,7 @@ async def resolve_query(query, requester):
         stream = pick_stream_url(info)
         if stream:
             track.stream_url, track.resolved_at = stream, time.time()
+            track.headers = info.get("http_headers")
         return [track], None
 
     tracks = []
@@ -1460,8 +1659,6 @@ async def resolve_query(query, requester):
                 tracks.append(t)
     if not tracks:
         raise UserFacingError("I couldn't find anything playable there.")
-    if not is_url:  # a text search: just the top result
-        return tracks[:1], None
     return tracks, info.get("title")
 
 
@@ -1766,15 +1963,18 @@ class MusicPlayer:
                 if self._skip or self.destroyed:
                     continue
 
-                # 2) play it
+                # 2) play it (ffmpeg's error output goes to a temp file so we can see WHY a stream failed)
+                err_file = tempfile.TemporaryFile()
                 try:
                     source = discord.FFmpegOpusAudio(
                         track.stream_url,
                         executable=FFMPEG_EXE,
-                        before_options=FFMPEG_BEFORE,
+                        before_options=ffmpeg_before(track.headers),
                         options=FFMPEG_OPTIONS,
+                        stderr=err_file,
                     )
                 except Exception as e:
+                    err_file.close()
                     log_error(f"ffmpeg start failed: {type(e).__name__} {str(e)[:150]}")
                     await self.say("⚠️ I couldn't start ffmpeg, so I can't play audio (see `!logs`).")
                     self.queue.clear()
@@ -1792,6 +1992,7 @@ class MusicPlayer:
                     vc.play(source, after=after_playback)
                 except Exception as e:
                     source.cleanup()
+                    err_file.close()
                     log_error(f"vc.play failed: {type(e).__name__} {str(e)[:150]}")
                     await self._count_failure()
                     continue
@@ -1799,7 +2000,10 @@ class MusicPlayer:
                 started = time.monotonic()
                 await self.refresh_panel()
                 self._prefetch_task = asyncio.create_task(self._prefetch())
-                await finished.wait()
+                try:
+                    await finished.wait()
+                finally:
+                    ffmpeg_errors = read_ffmpeg_errors(err_file)
                 if self.destroyed:
                     return
 
@@ -1809,13 +2013,20 @@ class MusicPlayer:
                     elapsed < 3 and not self._skip and (track.duration is None or track.duration > 10)
                 )
                 if died_instantly:
+                    detail = clean_ffmpeg_error(ffmpeg_errors)
+                    if detail:
+                        log_error(f"ffmpeg: {detail}")
                     if not track.retried:  # stream URLs can be rejected: try once more with a fresh one
                         track.retried = True
                         track.stream_url = None
                         self.queue.appendleft(track)
                     else:
                         log_error(f"'{shorten(track.title, 40)}' stopped immediately (ffmpeg/stream problem)")
-                        await self.say(f"⚠️ **{md_safe(shorten(track.title, 70))}** stopped right away — skipping it.")
+                        hint = ffmpeg_hint(ffmpeg_errors)
+                        await self.say(
+                            f"⚠️ **{md_safe(shorten(track.title, 70))}** stopped right away"
+                            f"{f' ({hint})' if hint else ''} — skipping it."
+                        )
                         await self._count_failure()
                     continue
                 self._fail_streak = 0
@@ -2183,8 +2394,14 @@ if __name__ == "__main__":
 
     if yt_dlp is None:
         print("⚠️ yt-dlp isn't installed: music commands are disabled (pip install -r requirements.txt)")
-    elif not ffmpeg_available():
-        print("⚠️ ffmpeg wasn't found: music can't play until it's installed (see requirements.txt / Dockerfile)")
+    else:
+        print(f"🎵 yt-dlp {ytdlp_version()} | JS runtime: {JS_STATUS} | ejs: {'yes' if ejs_installed() else 'NO'}")
+        if JS_STATUS.startswith("MISSING"):
+            print("⚠️ No usable JavaScript runtime: YouTube will NOT work. Add `deno` to requirements.txt and redeploy.")
+        if not ejs_installed():
+            print("⚠️ yt-dlp-ejs is missing: install with  pip install -U \"yt-dlp[default]\"")
+        if not ffmpeg_available():
+            print("⚠️ ffmpeg wasn't found: music can't play until it's installed (see requirements.txt / Dockerfile)")
 
     if not os.path.exists(COOKIE_PATH):
         print("⚠️ No YouTube cookies found (set YOUTUBE_COOKIES): YouTube will probably block this host.")
