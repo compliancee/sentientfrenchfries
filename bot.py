@@ -674,6 +674,22 @@ async def fftest(ctx, *, query: str):
     is_url = bool(re.match(r"https?://", query, re.IGNORECASE))
     if is_url:
         query = await expand_short_link(query)
+    spotify = parse_spotify(query) if is_url else None
+    if spotify:  # same path /play uses: read the Spotify metadata, then match the first track on YouTube/SoundCloud
+        async with ctx.typing():
+            try:
+                tracks, title = await resolve_spotify(spotify[0], spotify[1], ctx.author.display_name)
+                t = tracks[0]
+                await t._resolve_by_search()
+                await reply(
+                    ctx,
+                    f"✅ Spotify read OK ({len(tracks)} track(s)). First: **{md_safe(shorten(t.title, 70))}**\n"
+                    f"matched on **{t.origin}** → `{shorten(t.page_url, 80)}`\n"
+                    f"YouTube status: {youtube_status()}",
+                )
+            except Exception as e:
+                await reply(ctx, f"❌ `{type(e).__name__}` while playing the first Spotify track\n```{str(e)[:1500]}```")
+        return
     target = query if is_url else f"ytsearch1:{query}"
     async with ctx.typing():
         try:
