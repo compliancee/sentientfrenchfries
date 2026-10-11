@@ -24,7 +24,22 @@ try:
     import yt_dlp
 except ImportError:  # chat keeps working; music replies with a clear error instead
     yt_dlp = None
+import os
 
+#Tự động tạo file cookies.txt trên server Render khi bot khởi động
+if os.getenv("YTDLP_COOKIES"):
+    with open("cookies.txt", "w", encoding="utf-8") as f:
+        f.write(os.getenv("YTDLP_COOKIES"))
+
+YTDL_OPTIONS = {
+    'format': 'bestaudio/best',
+    'noplaylist': True,
+    'quiet': True,
+    'nocheckcertificate': True,
+    'source_address': '0.0.0.0',
+    # Bảo yt-dlp dùng file cookies vừa tạo
+    'cookiefile': 'cookies.txt' if os.path.exists("cookies.txt") else None
+}
 # --- CONFIG & ENVIRONMENT ---
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
