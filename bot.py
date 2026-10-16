@@ -13,9 +13,11 @@ import subprocess
 import http.cookiejar
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
@@ -82,15 +84,37 @@ SPOTIPY_CLIENT_SECRET = os.getenv("SPOTIPY_CLIENT_SECRET")
 # Should the bot's replies ping the person it is replying to? (the reply itself is always shown)
 REPLY_PING = False
 
+# --- REAL-TIME DATA SETTINGS ---
+# 1) The potato always knows the current date and time. BOT_TIMEZONE picks the zone (default UTC),
+#    e.g. BOT_TIMEZONE=Europe/London
+# 2) Live web search (news, scores, prices, weather...) through OpenRouter's `openrouter:web_search`
+#    server tool. The model decides by itself when a message needs it, so small talk costs nothing extra.
+#    Each search bills OpenRouter credits (roughly $4 per 1000 results). Limit it with WEB_MAX_RESULTS,
+#    switch it off with WEB_SEARCH=0, or flip it live with the admin command !ffsearch on/off.
+BOT_TZ_NAME = (os.getenv("BOT_TIMEZONE") or "UTC").strip()
+try:
+    BOT_TZ = ZoneInfo(BOT_TZ_NAME)
+except Exception:
+    print(f"⚠️ Unknown BOT_TIMEZONE '{BOT_TZ_NAME}', using UTC instead")
+    BOT_TZ, BOT_TZ_NAME = timezone.utc, "UTC"
+
+WEB_SEARCH = (os.getenv("WEB_SEARCH") or "1").strip().lower() not in ("0", "false", "no", "off")
+try:
+    WEB_MAX_RESULTS = max(1, min(10, int(os.getenv("WEB_MAX_RESULTS", "3"))))
+except ValueError:
+    WEB_MAX_RESULTS = 3
+
 # --- RESPONSE LENGTH SETTINGS ---
-# The prompt asks for ~6 sentences (simple) or ~20 (normal/complex).
-# The caps below are hard limits applied in code in case a model ignores the prompt.
-NORMAL_SENTENCE_CAP = 22
+# The prompt asks for 2-5 sentences in normal chat, and more whenever the topic really needs it
+# (explanations, how-tos, stories, complex questions). The caps below are hard limits applied in code
+# in case a model ignores the prompt; they are deliberately loose so the model can decide.
+NORMAL_SENTENCE_CAP = 40
 LONG_SENTENCE_CAP = 200      # only used when the user explicitly asks for something long
-NORMAL_MAX_TOKENS = 1200
+NORMAL_MAX_TOKENS = 2500     # generous, because some models spend part of this on "thinking"
 LONG_MAX_TOKENS = 7000
-NORMAL_TIMEOUT = 30          # seconds per model attempt
+NORMAL_TIMEOUT = 40          # seconds per model attempt
 LONG_TIMEOUT = 150
+SEARCH_EXTRA_TIMEOUT = 25    # extra seconds allowed when a live web search is attached
 MAX_CHUNKS = 15              # max Discord messages per reply
 
 # A user only gets "long mode" if they clearly ask for it (or add --long).
@@ -313,13 +337,18 @@ client = AsyncOpenAI(
     api_key=OPENROUTER_API_KEY,
 )
 
+# Model order = fallback order. Slugs that start with "~" are OpenRouter "latest" aliases: they always point at
+# the newest model of that family, so they don't break when a model gets retired (which is what killed
+# google/gemini-2.0-flash-001). The last entry is a pinned version as a safety net.
+# Change the list live with !ffmodel (no redeploy needed).
 DEFAULT_MODELS = [
-    "google/gemini-2.0-flash-001",
-    "meta-llama/llama-3.3-70b-instruct",
-    "deepseek/deepseek-chat",
+    "~google/gemini-flash-latest",
+    "~deepseek/deepseek-v4-flash-latest",
+    "google/gemini-3.8-flash",
 ]
 HUNT_LIST = list(DEFAULT_MODELS)
-MODEL_SLUG = re.compile(r"^[\w.\-]+/[\w.\-:]+$")
+MODEL_SLUG = re.compile(r"^~?[\w.\-]+/[\w.\-:]+$")
+DEAD_MODEL_SECONDS = 3600   # a model OpenRouter says no longer exists is skipped for this long
 
 # --- GLOBAL STATE ---
 memory_cache = {}
@@ -328,6 +357,8 @@ error_logs = []
 water_count = 0
 is_dead = False
 START_TIME = time.time()
+dead_models = {}      # model id -> time until which it is skipped ("No endpoints found" = retired/renamed)
+no_tool_models = set()  # models that can't use the web-search tool (they still chat, just without live search)
 players = {}       # guild id -> MusicPlayer
 join_locks = {}    # guild id -> asyncio.Lock (stops two /play calls connecting at once)
 _session = None    # shared aiohttp session, created on first use
@@ -452,7 +483,13 @@ def get_mood():
     return "extremely happy and sweet"
 
 
-def get_identity(long_mode=False, avoid_opener=None):
+def realtime_context():
+    """The current date and time in BOT_TIMEZONE, e.g. 'Friday, October 16, 2026, 15:04 (UTC)'."""
+    now = datetime.now(BOT_TZ)
+    return f"{now:%A, %B %d, %Y, %H:%M} ({BOT_TZ_NAME})"
+
+
+def get_identity(long_mode=False, avoid_opener=None, search=False):
     if long_mode:
         length = (
             "The user explicitly asked for something long. "
@@ -460,9 +497,10 @@ def get_identity(long_mode=False, avoid_opener=None):
         )
     else:
         length = (
-            "Length rules: for simple or casual messages, answer in about 6 sentences or fewer. "
-            "For normal-to-complex questions, use up to about 20 sentences. "
-            "Never go past 20 sentences."
+            "Length rules: text like a person in a chat. For normal messages and casual talk, "
+            "reply in 2 to 5 sentences. If the message really needs more (an explanation, a how-to, "
+            "a story, a comparison, or a complex question), use as many sentences as it takes, "
+            "but never pad or repeat yourself."
         )
     style = (
         "Start by answering the user's message directly. Never open with thanks or gratitude; "
@@ -471,9 +509,21 @@ def get_identity(long_mode=False, avoid_opener=None):
     )
     if avoid_opener:
         style += f" Your last reply began with '{avoid_opener}', so begin differently this time."
+    live = f"The current date and time is {realtime_context()}. Treat that as the real, current date. "
+    if search:
+        live += (
+            "For anything that changes over time (news, scores, prices, weather, or anything 'latest' or "
+            "'current') use your web search tool instead of guessing, then answer naturally without "
+            "mentioning the tool. Don't search for small talk or things you already know."
+        )
+    else:
+        live += (
+            "You can't look things up live right now, so for news, scores, prices or weather "
+            "say you can't check instead of guessing."
+        )
     return (
         f"You are 'ilovefrenchfries', a sentient potato. Be {get_mood()}. "
-        f"{style} {length} Never admit to being an AI."
+        f"{style} {length} {live} Never admit to being an AI."
     )
 
 
@@ -531,6 +581,64 @@ POTATO_FACTS = [
 
 
 # =============================================================================
+#  AI MODEL CALLS  (OpenRouter)
+# =============================================================================
+def model_is_gone(err):
+    """OpenRouter answers 404 'No endpoints found for <slug>' when a model was retired or renamed.
+    (A different 404, 'No endpoints found that support tool use', is NOT this: that one only means no web search.)"""
+    return "no endpoints found for" in str(err).lower()
+
+
+def tools_unsupported(err):
+    low = str(err).lower()
+    return any(k in low for k in ("support tool", "tool use", "tool calling", "function calling"))
+
+
+def live_models():
+    """Models worth trying right now: skips the ones OpenRouter recently said no longer exist."""
+    now = time.time()
+    alive = [m for m in HUNT_LIST if dead_models.get(m, 0) <= now]
+    return alive or list(HUNT_LIST)  # if everything looks dead, try them all anyway
+
+
+def model_label(model_id):
+    name = model_id.split("/")[-1]
+    return name + (" (gone)" if dead_models.get(model_id, 0) > time.time() else "")
+
+
+async def call_model(model_id, make_messages, max_tokens, timeout, search):
+    """Ask ONE model for a reply and return its text.
+    With `search` on, the model gets OpenRouter's live web-search tool and decides by itself whether to use it.
+    If that attempt fails (tools unsupported, search error, timeout...) the same model is asked again without
+    search, so a search problem never turns into "no answer"."""
+    attempts = [True, False] if (search and model_id not in no_tool_models) else [False]
+    for with_search in attempts:
+        extra = None
+        if with_search:
+            extra = {"tools": [{"type": "openrouter:web_search", "parameters": {"max_results": WEB_MAX_RESULTS}}]}
+        try:
+            completion = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=model_id,
+                    messages=make_messages(with_search),
+                    max_tokens=max_tokens,
+                    extra_body=extra,
+                ),
+                timeout=timeout + (SEARCH_EXTRA_TIMEOUT if with_search else 0),
+            )
+            text = (completion.choices[0].message.content or "").strip()
+            if not text:
+                raise ValueError("empty reply")
+            return text
+        except Exception as e:
+            if not with_search or model_is_gone(e):
+                raise
+            if tools_unsupported(e):
+                no_tool_models.add(model_id)  # remember it, so we don't pay this detour on every message
+            log_error(f"{model_id}: live search attempt failed, retrying without it: {type(e).__name__} {str(e)[:100]}")
+
+
+# =============================================================================
 #  NO DMs
 #  Prefix commands: a global check that fails outside servers.
 #  Slash commands: every command below carries @app_commands.guild_only().
@@ -558,29 +666,30 @@ async def chat(ctx, *, message: str):
     async with ctx.typing():
         history = list(memory_cache.get(ctx.channel.id, []))
         user_line = f"{ctx.author.display_name}: {message}"
-        messages = (
-            [{"role": "system", "content": get_identity(long_mode, last_openers.get(ctx.channel.id))}]
-            + history
-            + [{"role": "user", "content": user_line}]
-        )
+        opener = last_openers.get(ctx.channel.id)
+
+        def make_messages(with_search):
+            # rebuilt for every attempt, so the clock in the prompt is always current
+            return (
+                [{"role": "system", "content": get_identity(long_mode, opener, with_search)}]
+                + history
+                + [{"role": "user", "content": user_line}]
+            )
 
         response_text = None
-        for model_id in list(HUNT_LIST):
+        for model_id in live_models():
             try:
-                completion = await asyncio.wait_for(
-                    client.chat.completions.create(
-                        model=model_id,
-                        messages=messages,
-                        max_tokens=max_tokens,
-                    ),
-                    timeout=timeout,
-                )
-                response_text = (completion.choices[0].message.content or "").strip()
-                if response_text:
-                    break
-                log_error(f"{model_id}: empty reply")
+                response_text = await call_model(model_id, make_messages, max_tokens, timeout, WEB_SEARCH)
+                break
             except Exception as e:
-                log_error(f"{model_id} fail: {type(e).__name__} {str(e)[:100]}")
+                if model_is_gone(e):
+                    dead_models[model_id] = time.time() + DEAD_MODEL_SECONDS
+                    log_error(
+                        f"{model_id} no longer exists on OpenRouter: skipping it for "
+                        f"{DEAD_MODEL_SECONDS // 60} min (swap it with !ffmodel)"
+                    )
+                else:
+                    log_error(f"{model_id} fail: {type(e).__name__} {str(e)[:100]}")
 
         if not response_text:
             await reply(ctx, "The cloud is a desert. Try again in a bit.")
@@ -685,7 +794,10 @@ async def ffstatus(ctx):
         f"Clients:    {', '.join(PLAYER_CLIENTS) or 'yt-dlp default'}",
         f"ffmpeg:     {'ok' if ffmpeg_available() else 'MISSING'}",
         f"Spotify:    {'spotipy' if _spotipy_configured() else 'embed fallback'}",
-        f"Models:     {' > '.join(x.split('/')[-1] for x in HUNT_LIST)}",
+        f"Models:     {' > '.join(model_label(x) for x in HUNT_LIST)}",
+        f"Clock:      {realtime_context()}",
+        f"Web search: {'ON' if WEB_SEARCH else 'off'} ({WEB_MAX_RESULTS} results max)"
+        + (f", no tool support: {len(no_tool_models)} model(s)" if no_tool_models else ""),
     ]
     await reply(ctx, "🥔 **Potato Status**\n```" + "\n".join(lines) + "```")
 
@@ -756,6 +868,8 @@ async def ffmodel(ctx, action: str = "list", model_id: Optional[str] = None):
         if not model_id or not MODEL_SLUG.match(model_id):
             await reply(ctx, f"Usage: `!ffmodel {action} provider/model-name`")
             return
+        dead_models.pop(model_id, None)       # (re)trying a model clears its "gone" flag
+        no_tool_models.discard(model_id)
         if action == "add":
             if model_id in HUNT_LIST:
                 await reply(ctx, "That model is already in the list.")
@@ -775,12 +889,39 @@ async def ffmodel(ctx, action: str = "list", model_id: Optional[str] = None):
             HUNT_LIST.remove(model_id)
     elif action == "reset":
         HUNT_LIST[:] = DEFAULT_MODELS
+        dead_models.clear()
+        no_tool_models.clear()
     elif action != "list":
         await reply(ctx, "Usage: `!ffmodel [list | add <id> | remove <id> | first <id> | reset]`")
         return
 
-    listing = "\n".join(f"{i}. {m}" for i, m in enumerate(HUNT_LIST, 1))
+    now = time.time()
+    listing = "\n".join(
+        f"{i}. {m}" + ("   <- gone on OpenRouter, skipped" if dead_models.get(m, 0) > now else "")
+        for i, m in enumerate(HUNT_LIST, 1)
+    )
     await reply(ctx, f"🧠 **Model order:**\n```{listing}```")
+
+
+@bot.command()
+@is_admin()
+async def ffsearch(ctx, state: str = ""):
+    """Turn live web search on or off (no argument = show the current state)."""
+    global WEB_SEARCH
+    state = state.lower()
+    if state in ("on", "1", "true", "yes"):
+        WEB_SEARCH = True
+    elif state in ("off", "0", "false", "no"):
+        WEB_SEARCH = False
+    elif state:
+        await reply(ctx, "Usage: `!ffsearch [on | off]`")
+        return
+    await reply(
+        ctx,
+        f"🌐 Live web search is **{'ON' if WEB_SEARCH else 'OFF'}** "
+        f"(max {WEB_MAX_RESULTS} results per search, billed by OpenRouter). "
+        f"The potato always knows the date and time either way.",
+    )
 
 
 @bot.command()
@@ -848,7 +989,7 @@ async def fftest(ctx, *, query: str):
 # =============================================================================
 USER_COMMANDS = [
     ("🥔 Potato", [
-        ("!c  /  !chat <message>", "Chat with the potato (add `--long` for a long answer)"),
+        ("!c  /  !chat <message>", "Chat with the potato (knows the date/time and can look up live info; add `--long` for a long answer)"),
         ("!ffw", "Water the potato 💧"),
         ("!ffmood", "Check the potato's hydration and mood"),
         ("!fffact", "Hear a random potato fact"),
@@ -874,6 +1015,7 @@ ADMIN_COMMANDS = [
     ]),
     ("🧠 AI & memory", [
         ("!ffmodel [list|add|remove|first|reset] [provider/model]", "Manage the model fallback order"),
+        ("!ffsearch [on|off]", "Turn live web search on or off"),
         ("!ffwipe [all]", "Clear chat memory for this channel (or all channels)"),
     ]),
     ("📋 Diagnostics", [
@@ -2409,6 +2551,8 @@ if __name__ == "__main__":
         print("ℹ️ spotipy isn't installed: Spotify links use the embed-page fallback (pip install spotipy)")
     elif not _spotipy_configured():
         print("ℹ️ SPOTIPY_CLIENT_ID / SPOTIPY_CLIENT_SECRET not set: Spotify links use the embed-page fallback")
+
+    print(f"🧠 Models: {' > '.join(HUNT_LIST)} | web search: {'on' if WEB_SEARCH else 'off'} | clock: {realtime_context()}")
 
     try:
         bot.run(DISCORD_TOKEN)
