@@ -342,9 +342,7 @@ client = AsyncOpenAI(
 # google/gemini-2.0-flash-001). The last entry is a pinned version as a safety net.
 # Change the list live with !ffmodel (no redeploy needed).
 DEFAULT_MODELS = [
-    "~google/gemini-flash-latest",
-    "~deepseek/deepseek-v4-flash-latest",
-    "google/gemini-3.8-flash",
+    "gemini-2.5-flash",
 ]
 HUNT_LIST = list(DEFAULT_MODELS)
 MODEL_SLUG = re.compile(r"^~?[\w.\-]+/[\w.\-:]+$")
