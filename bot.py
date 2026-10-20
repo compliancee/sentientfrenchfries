@@ -80,6 +80,7 @@ YTDLP_PROXY = os.getenv("YTDLP_PROXY")       # proxy URL used by yt-dlp
 FFMPEG_PATH = os.getenv("FFMPEG_PATH")       # custom ffmpeg location
 SPOTIPY_CLIENT_ID = os.getenv("SPOTIPY_CLIENT_ID")
 SPOTIPY_CLIENT_SECRET = os.getenv("SPOTIPY_CLIENT_SECRET")
+DISCORD_PROXY = os.getenv("DISCORD_PROXY")   # optional proxy for Discord chat/commands, e.g. http://user:pass@host:port
 
 # Should the bot's replies ping the person it is replying to? (the reply itself is always shown)
 REPLY_PING = False
@@ -392,6 +393,7 @@ class PotatoBot(commands.Bot):
 bot = PotatoBot(
     command_prefix="!",
     intents=intents,
+    proxy=DISCORD_PROXY,  # None unless DISCORD_PROXY is set
     help_command=None,
     # blocks @everyone / role pings; replied_user controls the ping on Discord replies
     allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False, replied_user=REPLY_PING),
@@ -2552,7 +2554,21 @@ if __name__ == "__main__":
 
     print(f"🧠 Models: {' > '.join(HUNT_LIST)} | web search: {'on' if WEB_SEARCH else 'off'} | clock: {realtime_context()}")
 
+    # Cloudflare sometimes bans a shared Render IP for a while (Error 1015). Crashing makes Render
+    # restart instantly and hammer Discord again, so wait (the keep-alive server stays up), then restart cleanly.
+    RETRY_SECONDS = int(os.getenv("LOGIN_RETRY_SECONDS", "600"))
     try:
         bot.run(DISCORD_TOKEN)
+    except discord.LoginFailure:
+        print("FATAL ERROR: Discord rejected DISCORD_TOKEN (wrong or reset token).")
+        raise SystemExit(1)
+    except discord.HTTPException as e:
+        if e.status == 429:
+            print(f"⏳ Discord is rate limiting this host's IP (Cloudflare 1015). Retrying in {RETRY_SECONDS // 60} min...")
+            time.sleep(RETRY_SECONDS)
+            os.execv(sys.executable, [sys.executable] + sys.argv)  # fresh restart, same process
+        print(f"FATAL ERROR: HTTP {e.status} {str(e.text)[:200]}")
+        raise SystemExit(1)
     except Exception as e:
-        print(f"FATAL ERROR: {e}")
+        print(f"FATAL ERROR: {type(e).__name__} {str(e)[:200]}")
+        raise SystemExit(1)
