@@ -338,15 +338,20 @@ client = AsyncOpenAI(
     api_key=OPENROUTER_API_KEY,
 )
 
-# Model order = fallback order. Slugs that start with "~" are OpenRouter "latest" aliases: they always point at
-# the newest model of that family, so they don't break when a model gets retired (which is what killed
-# google/gemini-2.0-flash-001). The last entry is a pinned version as a safety net.
+# Model order = fallback order. EVERY slug needs its provider prefix ("google/gemini-2.5-flash", NOT
+# "gemini-2.5-flash"): without it OpenRouter answers "not a valid model ID" and every !chat fails.
+# Slugs that start with "~" are OpenRouter "latest" aliases: they always point at the newest model of that
+# family, so they don't break when a model gets retired (which is what killed google/gemini-2.0-flash-001).
 # Change the list live with !ffmodel (no redeploy needed).
 DEFAULT_MODELS = [
-    "gemini-2.5-flash",
+    "google/gemini-2.5-flash",
+    "google/gemini-2.5-flash-lite",
 ]
 HUNT_LIST = list(DEFAULT_MODELS)
 MODEL_SLUG = re.compile(r"^~?[\w.\-]+/[\w.\-:]+$")
+for _m in HUNT_LIST:  # catches a slug without its provider prefix at startup instead of at the first !chat
+    if not MODEL_SLUG.match(_m):
+        print(f"⚠️ Model '{_m}' has no provider prefix: OpenRouter needs e.g. 'google/gemini-2.5-flash'")
 DEAD_MODEL_SECONDS = 3600   # a model OpenRouter says no longer exists is skipped for this long
 
 # --- GLOBAL STATE ---
@@ -403,19 +408,31 @@ bot = PotatoBot(
 # =============================================================================
 #  RENDER KEEP-ALIVE SERVER
 #  Point UptimeRobot at https://<your-service>.onrender.com every 5 minutes.
+#  The page now reports whether the Discord bot is REALLY connected, so a green
+#  web server can no longer hide an offline bot. In UptimeRobot use a "Keyword"
+#  monitor with the keyword:  Discord: OK
 # =============================================================================
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def _ok(self):
-        self.send_response(200)
+    def _body(self):
+        try:
+            online = bot.is_ready()
+        except Exception:
+            online = False
+        return f"Potato Node: Online | Discord: {'OK' if online else 'OFFLINE'}".encode()
+
+    def _send_headers(self, body):
+        self.send_response(200)  # always 200, so Render never restart-loops and hammers Discord
         self.send_header("Content-type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
 
     def do_GET(self):
-        self._ok()
-        self.wfile.write(b"Potato Node: Online")
+        body = self._body()
+        self._send_headers(body)
+        self.wfile.write(body)
 
     def do_HEAD(self):  # UptimeRobot's free plan uses HEAD requests
-        self._ok()
+        self._send_headers(self._body())
 
     def log_message(self, format, *args):
         return
@@ -2521,7 +2538,9 @@ async def on_voice_state_update(member, before, after):
 
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id}) in {len(bot.guilds)} server(s)")
+    if not bot.guilds:
+        print("⚠️ The bot isn't in any server. Re-invite it with the 'bot' and 'applications.commands' scopes.")
 
 
 # --- EXECUTION ---
@@ -2561,6 +2580,9 @@ if __name__ == "__main__":
         bot.run(DISCORD_TOKEN)
     except discord.LoginFailure:
         print("FATAL ERROR: Discord rejected DISCORD_TOKEN (wrong or reset token).")
+        raise SystemExit(1)
+    except discord.PrivilegedIntentsRequired:
+        print("FATAL ERROR: turn on MESSAGE CONTENT INTENT in the Discord Developer Portal (Bot tab), then redeploy.")
         raise SystemExit(1)
     except discord.HTTPException as e:
         if e.status == 429:
