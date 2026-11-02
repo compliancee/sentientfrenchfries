@@ -665,16 +665,38 @@ async def block_dms(ctx):
     return ctx.guild is not None  # CheckFailure -> silently ignored in on_command_error
 
 
+# --- IMAGE INPUT ---
+# Images are NOT downloaded: Discord's own CDN link is handed straight to the model, so file size (anything
+# Discord lets people upload) costs the bot no RAM or bandwidth. Cost depends on the picture's dimensions, not MB.
+IMAGE_TYPES = ("image/png", "image/jpeg", "image/webp", "image/heic", "image/heif")  # what Gemini reads (no GIF)
+MAX_IMAGES = 3  # per message, to keep one command from getting expensive
+
+
+def get_image_urls(message):
+    urls = []
+    for a in message.attachments:
+        ctype = (a.content_type or "").split(";")[0].strip().lower()
+        if ctype in IMAGE_TYPES:
+            urls.append(a.url)
+    return urls[:MAX_IMAGES]
+
+
 # --- USER COMMANDS ---
 @bot.command(aliases=["c"])
 @commands.cooldown(1, 8, commands.BucketType.user)
-async def chat(ctx, *, message: str):
+async def chat(ctx, *, message: str = ""):
     if is_dead:
         await reply(ctx, "... (The potato is dead.)")
         return
 
+    image_urls = get_image_urls(ctx.message)
     long_mode = bool(LONG_PATTERN.search(message))
-    message = re.sub(r"--long\b", "", message, flags=re.IGNORECASE).strip() or "Say something."
+    message = re.sub(r"--long\b", "", message, flags=re.IGNORECASE).strip()
+    if not message and not image_urls:
+        await reply(ctx, "Say something to the potato: `!chat hello` (or attach a picture)")
+        return
+    if not message:
+        message = "What do you see in this image?" if image_urls else "Say something."
 
     max_tokens = LONG_MAX_TOKENS if long_mode else NORMAL_MAX_TOKENS
     timeout = LONG_TIMEOUT if long_mode else NORMAL_TIMEOUT
@@ -685,12 +707,19 @@ async def chat(ctx, *, message: str):
         user_line = f"{ctx.author.display_name}: {message}"
         opener = last_openers.get(ctx.channel.id)
 
+        if image_urls:
+            user_content = [{"type": "text", "text": user_line}] + [
+                {"type": "image_url", "image_url": {"url": u}} for u in image_urls
+            ]
+        else:
+            user_content = user_line
+
         def make_messages(with_search):
             # rebuilt for every attempt, so the clock in the prompt is always current
             return (
                 [{"role": "system", "content": get_identity(long_mode, opener, with_search)}]
                 + history
-                + [{"role": "user", "content": user_line}]
+                + [{"role": "user", "content": user_content}]
             )
 
         response_text = None
@@ -716,7 +745,8 @@ async def chat(ctx, *, message: str):
         last_openers[ctx.channel.id] = get_opener(response_text)
 
         # Save a shortened copy so long replies don't bloat future prompts
-        history.append({"role": "user", "content": user_line})
+        note = f" [attached {len(image_urls)} image(s)]" if image_urls else ""
+        history.append({"role": "user", "content": user_line + note})
         history.append({"role": "assistant", "content": response_text[:1500]})
         memory_cache[ctx.channel.id] = history[-6:]
 
@@ -1006,7 +1036,7 @@ async def fftest(ctx, *, query: str):
 # =============================================================================
 USER_COMMANDS = [
     ("🥔 Potato", [
-        ("!c  /  !chat <message>", "Chat with the potato (knows the date/time and can look up live info; add `--long` for a long answer)"),
+        ("!c  /  !chat <message>", "Chat with the potato (knows the date/time and can look up live info; add `--long` for a long answer, or attach a picture and I'll read it)"),
         ("!ffw", "Water the potato 💧"),
         ("!ffmood", "Check the potato's hydration and mood"),
         ("!fffact", "Hear a random potato fact"),
