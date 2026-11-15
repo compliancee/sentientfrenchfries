@@ -9,13 +9,14 @@ import shutil
 import asyncio
 import tempfile
 import threading
+import sqlite3
 import subprocess
 import http.cookiejar
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
@@ -1048,6 +1049,13 @@ USER_COMMANDS = [
         ("/skip  /pause  /resume  /stop", "Control playback"),
         ("/leave", "Disconnect the bot from voice"),
     ]),
+    ("🎰 Casino & Cases (fake fries only)", [
+        ("/balance  /daily  /work  /pay", "Check your fries, claim a daily streak bonus, earn hourly, pay a friend"),
+        ("/cases  /open", "Open CS2-style cases (real in-game odds), animated reveal"),
+        ("/inventory  /sell  /sellall", "View your skins and sell them for fries"),
+        ("/coinflip  /slots  /roulette  /blackjack", "Gamble your fries"),
+        ("/leaderboard", "Richest players in this server"),
+    ]),
     ("ℹ️ Help", [
         ("/cmd", "Show this panel"),
     ]),
@@ -1059,6 +1067,7 @@ ADMIN_COMMANDS = [
         ("!ffkill", "Kill the potato instantly"),
         ("!ffsetwater <0-100>", "Set hydration to an exact value (also revives)"),
         ("!ffsay <text>", "Make the potato say something (deletes your message)"),
+        ("!ffgive @user <amount>", "Give fries to a player (negative amount takes them away)"),
     ]),
     ("🧠 AI & memory", [
         ("!ffmodel [list|add|remove|first|reset] [provider/model]", "Manage the model fallback order"),
@@ -2508,6 +2517,966 @@ async def leave_cmd(interaction: discord.Interaction):
         await player.destroy()
     else:
         await vc.disconnect(force=True)
+
+
+# =============================================================================
+#  ECONOMY + CASINO  (fake currency only: fries have no real-world value and can't be cashed out)
+#  Storage is SQLite. On Render's free plan the disk is wiped on every redeploy/restart, so balances reset
+#  then. Point ECONOMY_DB at a persistent disk path (e.g. /var/data/potato.db) to keep them.
+# =============================================================================
+CURRENCY = "🍟"
+ECON_DB_PATH = os.getenv("ECONOMY_DB", "potato_economy.db")
+try:
+    MAX_BET = max(1, int(os.getenv("MAX_BET", "1000000")))
+except ValueError:
+    MAX_BET = 1_000_000
+START_BALANCE = 1000
+DAILY_BASE = 500
+DAILY_STREAK_BONUS = 50      # extra per streak day...
+DAILY_STREAK_MAX = 10        # ...up to this many days
+WORK_COOLDOWN = 3600
+MAX_CASES_AT_ONCE = 10
+
+
+def _gif_setting(name):
+    """A DIRECT image link from the environment (ends in .gif / static.klipy.com...). Page links don't render."""
+    url = (os.getenv(name) or "").strip()
+    if not url:
+        return ""
+    if not url.lower().startswith(("http://", "https://")) or re.match(
+            r"https?://(?:www\.)?klipy\.com/(?:gifs|clips|stickers)/", url, re.IGNORECASE):
+        print(f"⚠️ {name} must be a DIRECT image link (right-click the GIF > Copy image address), "
+              f"not a klipy.com page link: ignoring it")
+        return ""
+    return url
+
+
+CASE_SPIN_GIF = _gif_setting("CASE_SPIN_GIF")  # shown while a case spins, removed when the drop is revealed
+CASE_GOLD_GIF = _gif_setting("CASE_GOLD_GIF")  # shown on the reveal when the drop is gold
+
+# ---------- CS2-style cases ----------
+# Rarity odds are the real in-game case odds. Item lists, wear weights and fry values are this bot's own
+# approximations (they're NOT real market prices). Edit CASES freely: case prices are computed from the
+# items so the payout stays at CASE_RTP (a case is always worth ~90% of its price on average).
+RARITIES = {
+    "blue":   ("Mil-Spec", 0x4B69FF, "🟦"),
+    "purple": ("Restricted", 0x8847FF, "🟪"),
+    "pink":   ("Classified", 0xD32CE6, "🌸"),
+    "red":    ("Covert", 0xEB4B4B, "🟥"),
+    "gold":   ("Rare Special", 0xFFD700, "🟨"),
+}
+RARITY_ODDS = [("blue", 0.7992), ("purple", 0.1598), ("pink", 0.0320), ("red", 0.0064), ("gold", 0.0026)]
+WEARS = [  # (name, float min, float max, value multiplier)
+    ("Factory New", 0.00, 0.07, 1.60),
+    ("Minimal Wear", 0.07, 0.15, 1.25),
+    ("Field-Tested", 0.15, 0.38, 1.00),
+    ("Well-Worn", 0.38, 0.45, 0.80),
+    ("Battle-Scarred", 0.45, 1.00, 0.65),
+]
+WEAR_SHORT = {"Factory New": "FN", "Minimal Wear": "MW", "Field-Tested": "FT", "Well-Worn": "WW", "Battle-Scarred": "BS"}
+ST_CHANCE = 0.10   # StatTrak drop chance
+ST_MULT = 1.8
+CASE_RTP = 0.90
+
+CASES = {
+    "hashbrown": {
+        "name": "Hash Brown Case", "emoji": "🥔",
+        "items": {
+            "blue": [("P250 | Muertos", 10), ("MP9 | Bulldozer", 8), ("Nova | Bloomstick", 9),
+                     ("Galil AR | Chatterbox", 14), ("MAC-10 | Neon Rider", 16)],
+            "purple": [("Five-SeveN | Monkey Business", 45), ("Tec-9 | Fuel Injector", 55),
+                       ("UMP-45 | Primal Saber", 50), ("FAMAS | Roll Cage", 40)],
+            "pink": [("USP-S | Orion", 180), ("MP7 | Bloodsport", 140), ("Glock-18 | Water Elemental", 160)],
+            "red": [("AK-47 | Redline", 650), ("P90 | Asiimov", 550)],
+            "gold": [("★ Gut Knife | Autotronic", 3500), ("★ Falchion Knife | Crimson Web", 5200)],
+        },
+    },
+    "spud": {
+        "name": "Spud Weapon Case", "emoji": "📦",
+        "items": {
+            "blue": [("SG 553 | Cyrex", 35), ("XM1014 | Tranquility", 40), ("Sawed-Off | The Kraken", 30),
+                     ("CZ75-Auto | Victoria", 45), ("Negev | Loudmouth", 28)],
+            "purple": [("Desert Eagle | Conspiracy", 150), ("USP-S | Kill Confirmed", 190),
+                       ("M4A4 | Asiimov", 210), ("AK-47 | Vulcan", 230)],
+            "pink": [("AWP | Asiimov", 650), ("M4A1-S | Hyper Beast", 600), ("Glock-18 | Fade", 900)],
+            "red": [("AWP | Hyper Beast", 2200), ("AK-47 | Fire Serpent", 3800)],
+            "gold": [("★ Flip Knife | Gamma Doppler", 9000), ("★ Bayonet | Marble Fade", 14000)],
+        },
+    },
+    "golden": {
+        "name": "Golden Tater Case", "emoji": "👑",
+        "items": {
+            "blue": [("Desert Eagle | Blaze", 260), ("R8 Revolver | Fade", 320), ("M249 | Nebula Crusader", 240),
+                     ("SSG 08 | Dragonfire", 300), ("AUG | Chameleon", 280)],
+            "purple": [("M4A1-S | Knight", 1100), ("AWP | Gungnir", 1500), ("AK-47 | Vulcan", 1200),
+                       ("USP-S | Kill Confirmed", 1300)],
+            "pink": [("AWP | Medusa", 4000), ("M4A4 | Howl", 5200), ("AK-47 | Fire Serpent", 4600)],
+            "red": [("AWP | Dragon Lore", 18000), ("AK-47 | Wild Lotus", 14000)],
+            "gold": [("★ Karambit | Doppler", 55000), ("★ Butterfly Knife | Fade", 80000),
+                     ("★ Sport Gloves | Pandora's Box", 42000)],
+        },
+    },
+}
+
+
+def is_glove(name):
+    return "Gloves" in name or "Hand Wraps" in name  # gloves can't be StatTrak
+
+
+AVG_WEAR_MULT = sum((hi - lo) * mult for _, lo, hi, mult in WEARS)
+
+
+def case_expected_value(case):
+    ev = 0.0
+    for rar, p in RARITY_ODDS:
+        items = case["items"][rar]
+        total = sum(base * AVG_WEAR_MULT * (1 if is_glove(n) else 1 + ST_CHANCE * (ST_MULT - 1)) for n, base in items)
+        ev += p * total / len(items)
+    return ev
+
+
+for _case in CASES.values():
+    _case.setdefault("price", max(10, int(round(case_expected_value(_case) / CASE_RTP, -1))))
+
+
+def wear_for(flt):
+    for name, lo, hi, mult in WEARS:
+        if flt < hi:
+            return name, mult
+    return WEARS[-1][0], WEARS[-1][3]
+
+
+def roll_item(case_key, rng=random):
+    case = CASES[case_key]
+    r, acc, rarity = rng.random(), 0.0, RARITY_ODDS[-1][0]
+    for rar, p in RARITY_ODDS[:-1]:
+        acc += p
+        if r < acc:
+            rarity = rar
+            break
+    name, base = rng.choice(case["items"][rarity])
+    flt = rng.random()
+    wear, mult = wear_for(flt)
+    st = (not is_glove(name)) and rng.random() < ST_CHANCE
+    value = max(1, round(base * mult * (ST_MULT if st else 1)))
+    return {"name": name, "rarity": rarity, "wear": wear, "wear_float": flt,
+            "stattrak": int(st), "value": value, "case_key": case_key}
+
+
+def display_name(item, short=False):
+    name, wear = item["name"], item["wear"]
+    if item["stattrak"]:
+        name = ("★ StatTrak™ " + name[2:]) if name.startswith("★ ") else "StatTrak™ " + name
+    return f"{name} ({WEAR_SHORT.get(wear, wear) if short else wear})"
+
+
+# ---------- slots ----------
+SLOT_REELS = [("🍒", 30), ("🍋", 24), ("🍇", 18), ("🔔", 12), ("💎", 6), ("🥔", 6), ("7️⃣", 3)]
+SLOT_TRIPLE = {"🍒": 6, "🍋": 10, "🍇": 16, "🔔": 30, "💎": 80, "🥔": 60, "7️⃣": 250}
+SLOT_TWO_CHERRIES = 2  # exactly two 🍒 anywhere
+
+
+def spin_slots(rng=random):
+    symbols, weights = zip(*SLOT_REELS)
+    return rng.choices(symbols, weights=weights, k=3)
+
+
+def slots_multiplier(reels):
+    if reels[0] == reels[1] == reels[2]:
+        return SLOT_TRIPLE[reels[0]]
+    if reels.count("🍒") == 2:
+        return SLOT_TWO_CHERRIES
+    return 0
+
+
+# ---------- roulette (European: 0-36) ----------
+RED_NUMBERS = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
+
+
+def roulette_color(n):
+    return "green" if n == 0 else ("red" if n in RED_NUMBERS else "black")
+
+
+def parse_roulette_bet(text):
+    """Returns (label, total payout multiplier, test(number)->bool) or None."""
+    t = str(text).strip().lower()
+    even_money = {
+        "red": lambda n: n in RED_NUMBERS,
+        "black": lambda n: n != 0 and n not in RED_NUMBERS,
+        "even": lambda n: n != 0 and n % 2 == 0,
+        "odd": lambda n: n % 2 == 1,
+        "low": lambda n: 1 <= n <= 18,
+        "high": lambda n: 19 <= n <= 36,
+    }
+    if t in even_money:
+        return t, 2, even_money[t]
+    if t in ("green", "zero"):
+        t = "0"
+    if t.isdigit() and 0 <= int(t) <= 36:
+        num = int(t)
+        return f"number {num}", 36, (lambda n, num=num: n == num)
+    return None
+
+
+# ---------- blackjack ----------
+RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+SUITS = "♠♥♦♣"
+
+
+def draw_card(rng=random):
+    return rng.choice(RANKS) + rng.choice(SUITS)
+
+
+def hand_value(cards):
+    total, aces = 0, 0
+    for c in cards:
+        r = c[:-1]
+        if r == "A":
+            total, aces = total + 11, aces + 1
+        elif r in ("J", "Q", "K"):
+            total += 10
+        else:
+            total += int(r)
+    while total > 21 and aces:
+        total, aces = total - 10, aces - 1
+    return total
+
+
+def is_blackjack(cards):
+    return len(cards) == 2 and hand_value(cards) == 21
+
+
+def dealer_play(dealer, rng=random):
+    while hand_value(dealer) < 17:
+        dealer.append(draw_card(rng))
+    return dealer
+
+
+def blackjack_settle(player, dealer, bet):
+    """Dealer has already played. Returns (outcome, total paid back to the player; the bet is already taken)."""
+    pv, dv = hand_value(player), hand_value(dealer)
+    if pv > 21:
+        return "bust", 0
+    if dv > 21 or pv > dv:
+        return "win", bet * 2
+    if pv == dv:
+        return "push", bet
+    return "lose", 0
+
+
+# ---------- amounts ----------
+def parse_amount(text, balance):
+    t = str(text).strip().lower().replace(",", "").replace("_", "")
+    if t in ("all", "max", "allin"):
+        return min(balance, MAX_BET)
+    if t == "half":
+        return min(balance // 2, MAX_BET)
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([kmb]?)", t)
+    if not m:
+        return None
+    return int(float(m[1]) * {"": 1, "k": 1e3, "m": 1e6, "b": 1e9}[m[2]])
+
+
+def parse_bet(text, balance):
+    """Returns (bet, error_message)."""
+    bet = parse_amount(text, balance)
+    if bet is None:
+        return None, "I didn't understand that amount. Use a number, `1k`, `2.5m`, `half` or `all`."
+    if bet < 1:
+        return None, "The bet has to be at least 1."
+    if bet > MAX_BET:
+        return None, f"The max bet is {MAX_BET:,} {CURRENCY}."
+    if bet > balance:
+        return None, f"You only have {balance:,} {CURRENCY}."
+    return bet, None
+
+
+def money(n):
+    return f"{int(n):,} {CURRENCY}"
+
+
+def fmt_wait(seconds):
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m = rem // 60
+    return f"{h}h {m}m" if h else (f"{m}m" if m else f"{seconds}s")
+
+
+# ---------- database ----------
+class EconomyDB:
+    def __init__(self, path):
+        self.lock = threading.RLock()
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        with self.lock:
+            self.conn.executescript("""
+                CREATE TABLE IF NOT EXISTS users (
+                    guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                    balance INTEGER NOT NULL DEFAULT 0,
+                    last_daily REAL NOT NULL DEFAULT 0, streak INTEGER NOT NULL DEFAULT 0,
+                    last_work REAL NOT NULL DEFAULT 0,
+                    PRIMARY KEY (guild_id, user_id));
+                CREATE TABLE IF NOT EXISTS items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                    name TEXT NOT NULL, rarity TEXT NOT NULL, wear TEXT NOT NULL,
+                    wear_float REAL NOT NULL, stattrak INTEGER NOT NULL DEFAULT 0,
+                    value INTEGER NOT NULL, case_key TEXT NOT NULL, created REAL NOT NULL);
+                CREATE INDEX IF NOT EXISTS idx_items_owner ON items (guild_id, user_id);
+            """)
+            self.conn.commit()
+
+    def q(self, sql, args=(), one=False):
+        with self.lock:
+            cur = self.conn.execute(sql, args)
+            return cur.fetchone() if one else cur.fetchall()
+
+    def x(self, sql, args=()):
+        with self.lock:
+            cur = self.conn.execute(sql, args)
+            self.conn.commit()
+            return cur
+
+    def ensure(self, g, u):
+        self.x("INSERT OR IGNORE INTO users (guild_id, user_id, balance) VALUES (?, ?, ?)", (g, u, START_BALANCE))
+
+    def balance(self, g, u):
+        self.ensure(g, u)
+        return self.q("SELECT balance FROM users WHERE guild_id=? AND user_id=?", (g, u), one=True)["balance"]
+
+    def add(self, g, u, amount):
+        self.ensure(g, u)
+        self.x("UPDATE users SET balance = balance + ? WHERE guild_id=? AND user_id=?", (int(amount), g, u))
+
+    def give(self, g, u, amount):
+        """Admin: add (or take, with a negative number) fries; never goes below 0."""
+        self.ensure(g, u)
+        self.x("UPDATE users SET balance = MAX(0, balance + ?) WHERE guild_id=? AND user_id=?", (int(amount), g, u))
+
+    def spend(self, g, u, amount):
+        """Atomically take `amount`. False (and nothing changes) if the balance is too low."""
+        self.ensure(g, u)
+        cur = self.x("UPDATE users SET balance = balance - ? WHERE guild_id=? AND user_id=? AND balance >= ?",
+                     (int(amount), g, u, int(amount)))
+        return cur.rowcount == 1
+
+    def transfer(self, g, src, dst, amount):
+        with self.lock:
+            self.ensure(g, src)
+            self.ensure(g, dst)
+            cur = self.conn.execute(
+                "UPDATE users SET balance = balance - ? WHERE guild_id=? AND user_id=? AND balance >= ?",
+                (amount, g, src, amount))
+            if cur.rowcount != 1:
+                self.conn.rollback()
+                return False
+            self.conn.execute("UPDATE users SET balance = balance + ? WHERE guild_id=? AND user_id=?", (amount, g, dst))
+            self.conn.commit()
+            return True
+
+    def claim_daily(self, g, u, now=None):
+        """Returns (claimed, reward, streak, seconds_to_wait)."""
+        now = time.time() if now is None else now
+        self.ensure(g, u)
+        row = self.q("SELECT last_daily, streak FROM users WHERE guild_id=? AND user_id=?", (g, u), one=True)
+        last, streak = row["last_daily"], row["streak"]
+        if last and now - last < 86400:
+            return False, 0, streak, last + 86400 - now
+        streak = streak + 1 if last and now - last < 172800 else 1
+        reward = DAILY_BASE + DAILY_STREAK_BONUS * min(streak - 1, DAILY_STREAK_MAX)
+        self.x("UPDATE users SET balance = balance + ?, last_daily=?, streak=? WHERE guild_id=? AND user_id=?",
+               (reward, now, streak, g, u))
+        return True, reward, streak, 0
+
+    def claim_work(self, g, u, now=None, rng=random):
+        """Returns (claimed, reward, seconds_to_wait)."""
+        now = time.time() if now is None else now
+        self.ensure(g, u)
+        last = self.q("SELECT last_work FROM users WHERE guild_id=? AND user_id=?", (g, u), one=True)["last_work"]
+        if last and now - last < WORK_COOLDOWN:
+            return False, 0, last + WORK_COOLDOWN - now
+        reward = rng.randint(80, 200)
+        self.x("UPDATE users SET balance = balance + ?, last_work=? WHERE guild_id=? AND user_id=?", (reward, now, g, u))
+        return True, reward, 0
+
+    def add_item(self, g, u, item):
+        cur = self.x(
+            "INSERT INTO items (guild_id, user_id, name, rarity, wear, wear_float, stattrak, value, case_key, created)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (g, u, item["name"], item["rarity"], item["wear"], item["wear_float"],
+             item["stattrak"], item["value"], item["case_key"], time.time()))
+        return cur.lastrowid
+
+    def items(self, g, u, limit=10, offset=0):
+        return self.q("SELECT * FROM items WHERE guild_id=? AND user_id=? ORDER BY value DESC, id DESC LIMIT ? OFFSET ?",
+                      (g, u, limit, offset))
+
+    def inventory_stats(self, g, u):
+        row = self.q("SELECT COUNT(*) AS c, COALESCE(SUM(value), 0) AS v FROM items WHERE guild_id=? AND user_id=?",
+                     (g, u), one=True)
+        return row["c"], row["v"]
+
+    def sell_item(self, g, u, item_id):
+        """Sell one item you own. Returns the fries received, or None if it isn't yours / already sold."""
+        with self.lock:
+            self.ensure(g, u)
+            row = self.conn.execute("SELECT value FROM items WHERE id=? AND guild_id=? AND user_id=?",
+                                    (item_id, g, u)).fetchone()
+            if not row:
+                return None
+            self.conn.execute("DELETE FROM items WHERE id=?", (item_id,))
+            self.conn.execute("UPDATE users SET balance = balance + ? WHERE guild_id=? AND user_id=?",
+                              (row["value"], g, u))
+            self.conn.commit()
+            return row["value"]
+
+    def sell_rarities(self, g, u, rarities):
+        """Sell every item of the given rarities. Returns (count, fries)."""
+        marks = ",".join("?" for _ in rarities)
+        with self.lock:
+            self.ensure(g, u)
+            row = self.conn.execute(
+                f"SELECT COUNT(*) AS c, COALESCE(SUM(value), 0) AS v FROM items "
+                f"WHERE guild_id=? AND user_id=? AND rarity IN ({marks})", (g, u, *rarities)).fetchone()
+            if row["c"]:
+                self.conn.execute(f"DELETE FROM items WHERE guild_id=? AND user_id=? AND rarity IN ({marks})",
+                                  (g, u, *rarities))
+                self.conn.execute("UPDATE users SET balance = balance + ? WHERE guild_id=? AND user_id=?",
+                                  (row["v"], g, u))
+                self.conn.commit()
+            return row["c"], row["v"]
+
+    def leaderboard(self, g, limit=10):
+        """Top players by net worth (balance + inventory value)."""
+        return self.q(
+            "SELECT u.user_id AS user_id, u.balance + COALESCE((SELECT SUM(i.value) FROM items i "
+            "WHERE i.guild_id=u.guild_id AND i.user_id=u.user_id), 0) AS worth "
+            "FROM users u WHERE u.guild_id=? ORDER BY worth DESC LIMIT ?", (g, limit))
+
+
+def open_economy():
+    try:
+        return EconomyDB(ECON_DB_PATH)
+    except Exception as e:
+        print(f"⚠️ Couldn't open {ECON_DB_PATH} ({type(e).__name__}): economy will live in memory and reset on restart")
+        return EconomyDB(":memory:")
+
+
+econ = open_economy()
+
+
+# ---------- Discord side ----------
+CASE_CHOICES = [app_commands.Choice(name=f"{c['name']} - {c['price']:,} fries", value=k) for k, c in CASES.items()]
+JOBS = [
+    "peeled potatoes at the fry shack", "flipped burgers next to the fryer", "delivered sacks of spuds",
+    "washed dishes at a diner", "sold ketchup door to door", "harvested a field of potatoes",
+    "juggled hot potatoes at a street fair", "drove a fry truck",
+]
+bj_active = set()  # (guild_id, user_id) with a blackjack hand in progress
+
+
+def econ_embed(title, description, color=POTATO_COLOR):
+    return discord.Embed(title=title, description=description, color=color)
+
+
+async def take_bet(interaction, amount_text):
+    """Validate the bet and take it from the balance. Replies (privately) and returns None if it can't."""
+    g, u = interaction.guild.id, interaction.user.id
+    bet, err = parse_bet(amount_text, econ.balance(g, u))
+    if err:
+        await interaction.response.send_message(f"❌ {err}", ephemeral=True)
+        return None
+    if not econ.spend(g, u, bet):
+        await interaction.response.send_message(f"❌ You don't have {money(bet)}.", ephemeral=True)
+        return None
+    return bet
+
+
+# ----- basics -----
+@bot.tree.command(name="balance", description="Check your fries (or someone else's)")
+@app_commands.describe(user="Whose balance to check (default: you)")
+@app_commands.guild_only()
+async def balance_cmd(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    target = user or interaction.user
+    g = interaction.guild.id
+    count, value = econ.inventory_stats(g, target.id)
+    embed = econ_embed(f"{CURRENCY} {target.display_name}", None)
+    embed.add_field(name="Balance", value=money(econ.balance(g, target.id)))
+    embed.add_field(name="Inventory", value=f"{count} item(s) worth {money(value)}")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="daily", description="Claim your daily fries (streaks give a bonus)")
+@app_commands.guild_only()
+async def daily_cmd(interaction: discord.Interaction):
+    g, u = interaction.guild.id, interaction.user.id
+    ok, reward, streak, wait = econ.claim_daily(g, u)
+    if not ok:
+        await interaction.response.send_message(f"⏳ Come back in **{fmt_wait(wait)}** for your next daily.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"🎁 **+{money(reward)}** — day **{streak}** streak! Balance: {money(econ.balance(g, u))}"
+    )
+
+
+@bot.tree.command(name="work", description="Do a quick job for fries (once an hour)")
+@app_commands.guild_only()
+async def work_cmd(interaction: discord.Interaction):
+    g, u = interaction.guild.id, interaction.user.id
+    ok, reward, wait = econ.claim_work(g, u)
+    if not ok:
+        await interaction.response.send_message(f"⏳ You're tired. Work again in **{fmt_wait(wait)}**.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"💼 You {random.choice(JOBS)} and earned **{money(reward)}**. Balance: {money(econ.balance(g, u))}"
+    )
+
+
+@bot.tree.command(name="pay", description="Give some of your fries to another player")
+@app_commands.describe(user="Who gets the fries", amount="A number, 1k, 2.5m, half or all")
+@app_commands.guild_only()
+async def pay_cmd(interaction: discord.Interaction, user: discord.Member, amount: str):
+    g, u = interaction.guild.id, interaction.user.id
+    if user.bot or user.id == u:
+        await interaction.response.send_message("❌ Pick another (human) player.", ephemeral=True)
+        return
+    bet, err = parse_bet(amount, econ.balance(g, u))
+    if err:
+        await interaction.response.send_message(f"❌ {err}", ephemeral=True)
+        return
+    if not econ.transfer(g, u, user.id, bet):
+        await interaction.response.send_message("❌ You don't have enough fries.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"💸 {interaction.user.mention} paid {user.mention} **{money(bet)}**.")
+
+
+@bot.tree.command(name="leaderboard", description="Richest players in this server (balance + inventory)")
+@app_commands.guild_only()
+async def leaderboard_cmd(interaction: discord.Interaction):
+    rows = econ.leaderboard(interaction.guild.id, 10)
+    if not rows:
+        await interaction.response.send_message("Nobody has any fries yet. Try `/daily`!", ephemeral=True)
+        return
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, r in enumerate(rows):
+        member = interaction.guild.get_member(r["user_id"])
+        name = md_safe(member.display_name) if member else f"<@{r['user_id']}>"
+        lines.append(f"{medals[i] if i < 3 else f'`{i + 1}.`'} **{name}** — {money(r['worth'])}")
+    await interaction.response.send_message(embed=econ_embed("🏆 Richest potatoes", "\n".join(lines)))
+
+
+# ----- simple games -----
+@bot.tree.command(name="coinflip", description="Bet on heads or tails (pays 2x)")
+@app_commands.describe(amount="A number, 1k, 2.5m, half or all", side="Heads or tails")
+@app_commands.guild_only()
+@app_commands.checks.cooldown(1, 2.0)
+async def coinflip_cmd(interaction: discord.Interaction, amount: str, side: Literal["heads", "tails"]):
+    bet = await take_bet(interaction, amount)
+    if bet is None:
+        return
+    g, u = interaction.guild.id, interaction.user.id
+    result = random.choice(["heads", "tails"])
+    won = result == side
+    if won:
+        econ.add(g, u, bet * 2)
+    embed = econ_embed(
+        f"🪙 {result.title()}!",
+        (f"You called **{side}** and **won {money(bet)}**!" if won else f"You called **{side}** and lost **{money(bet)}**.")
+        + f"\nBalance: {money(econ.balance(g, u))}",
+        0x57F287 if won else 0xED4245,
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="slots", description="Spin the slot machine")
+@app_commands.describe(amount="A number, 1k, 2.5m, half or all")
+@app_commands.guild_only()
+@app_commands.checks.cooldown(1, 3.0)
+async def slots_cmd(interaction: discord.Interaction, amount: str):
+    bet = await take_bet(interaction, amount)
+    if bet is None:
+        return
+    g, u = interaction.guild.id, interaction.user.id
+    reels = spin_slots()
+    mult = slots_multiplier(reels)
+    payout = bet * mult
+    if payout:
+        econ.add(g, u, payout)
+    await interaction.response.send_message(embed=econ_embed("🎰 Slots", "🎰 | 🎰 | 🎰\n*spinning...*"))
+    await asyncio.sleep(1.2)
+    if mult:
+        result = f"**{mult}x** — you won **{money(payout - bet)}**!" if mult > 1 else "Push."
+        color = 0x57F287
+        if mult >= 50:
+            result = "🎉 **JACKPOT!** " + result
+    else:
+        result, color = f"No match. You lost **{money(bet)}**.", 0xED4245
+    embed = econ_embed("🎰 Slots", f"{' | '.join(reels)}\n\n{result}\nBalance: {money(econ.balance(g, u))}", color)
+    embed.set_footer(text="Pays: 3 of a kind, or exactly two 🍒 (2x)")
+    await interaction.edit_original_response(embed=embed)
+
+
+@bot.tree.command(name="roulette", description="Bet on red/black, even/odd, low/high (2x) or a number 0-36 (36x)")
+@app_commands.describe(amount="A number, 1k, 2.5m, half or all",
+                       bet="red, black, even, odd, low (1-18), high (19-36) or a number 0-36")
+@app_commands.guild_only()
+@app_commands.checks.cooldown(1, 3.0)
+async def roulette_cmd(interaction: discord.Interaction, amount: str, bet: str):
+    parsed = parse_roulette_bet(bet)
+    if parsed is None:
+        await interaction.response.send_message(
+            "❌ Bet on `red`, `black`, `even`, `odd`, `low`, `high`, or a number from 0 to 36.", ephemeral=True)
+        return
+    label, mult, test = parsed
+    stake = await take_bet(interaction, amount)
+    if stake is None:
+        return
+    g, u = interaction.guild.id, interaction.user.id
+    number = random.randint(0, 36)
+    color = roulette_color(number)
+    emoji = {"red": "🔴", "black": "⚫", "green": "🟢"}[color]
+    won = test(number)
+    if won:
+        econ.add(g, u, stake * mult)
+    text = (f"The ball landed on {emoji} **{number}**.\nYou bet on **{label}** and "
+            + (f"**won {money(stake * mult - stake)}**!" if won else f"lost **{money(stake)}**.")
+            + f"\nBalance: {money(econ.balance(g, u))}")
+    await interaction.response.send_message(
+        embed=econ_embed("🎡 Roulette", text, 0x57F287 if won else 0xED4245))
+
+
+# ----- blackjack -----
+class BlackjackGame:
+    def __init__(self, guild_id, user_id, name, bet):
+        self.guild_id, self.user_id, self.name, self.bet = guild_id, user_id, name, bet
+        self.player = [draw_card(), draw_card()]
+        self.dealer = [draw_card(), draw_card()]
+        self.finished = False
+        self.outcome = None
+        self.payout = 0
+
+    def settle(self):
+        """Resolve the hand (dealer plays if needed), pay out, and free the player for a new game."""
+        if self.finished:
+            return
+        if hand_value(self.player) <= 21:
+            dealer_play(self.dealer)
+        self.outcome, self.payout = blackjack_settle(self.player, self.dealer, self.bet)
+        self._finish()
+
+    def settle_natural(self):
+        if is_blackjack(self.dealer):
+            self.outcome, self.payout = "push", self.bet
+        else:
+            self.outcome, self.payout = "blackjack", self.bet + (self.bet * 3) // 2
+        self._finish()
+
+    def _finish(self):
+        self.finished = True
+        if self.payout:
+            econ.add(self.guild_id, self.user_id, self.payout)
+        bj_active.discard((self.guild_id, self.user_id))
+
+
+def fmt_cards(cards):
+    return "  ".join(f"`{c}`" for c in cards)
+
+
+def blackjack_embed(game):
+    reveal = game.finished
+    dealer = fmt_cards(game.dealer) if reveal else f"`{game.dealer[0]}`  `??`"
+    dealer_val = hand_value(game.dealer) if reveal else hand_value(game.dealer[:1])
+    embed = discord.Embed(title="🃏 Blackjack", color=POTATO_COLOR)
+    embed.add_field(name=f"Dealer ({dealer_val})", value=dealer, inline=False)
+    embed.add_field(name=f"{game.name} ({hand_value(game.player)})", value=fmt_cards(game.player), inline=False)
+    if game.finished:
+        net = game.payout - game.bet
+        text, color = {
+            "blackjack": (f"🂡 **Blackjack!** You won **{money(net)}**.", 0x57F287),
+            "win": (f"✅ You won **{money(net)}**!", 0x57F287),
+            "push": ("🤝 Push. Your bet is returned.", 0x95A5A6),
+            "lose": (f"❌ Dealer wins. You lost **{money(game.bet)}**.", 0xED4245),
+            "bust": (f"💥 Bust! You lost **{money(game.bet)}**.", 0xED4245),
+        }[game.outcome]
+        embed.color = color
+        embed.add_field(name="Result", value=f"{text}\nBalance: {money(econ.balance(game.guild_id, game.user_id))}",
+                        inline=False)
+    else:
+        embed.set_footer(text=f"Bet: {game.bet:,} fries  •  Hit, Stand, or Double (first move only)")
+    return embed
+
+
+class BlackjackView(discord.ui.View):
+    def __init__(self, game):
+        super().__init__(timeout=120)
+        self.game = game
+        self.message = None
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.game.user_id:
+            await interaction.response.send_message("❌ This isn't your hand.", ephemeral=True)
+            return False
+        return True
+
+    async def _end(self, interaction):
+        self.game.settle()
+        self.stop()
+        await interaction.response.edit_message(embed=blackjack_embed(self.game), view=None)
+
+    @discord.ui.button(label="Hit", emoji="🃏", style=discord.ButtonStyle.primary)
+    async def hit_btn(self, interaction, button):
+        game = self.game
+        game.player.append(draw_card())
+        if hand_value(game.player) >= 21:  # bust, or 21 (stand automatically)
+            await self._end(interaction)
+        else:
+            await interaction.response.edit_message(embed=blackjack_embed(game), view=self)
+
+    @discord.ui.button(label="Stand", emoji="✋", style=discord.ButtonStyle.secondary)
+    async def stand_btn(self, interaction, button):
+        await self._end(interaction)
+
+    @discord.ui.button(label="Double", emoji="✌️", style=discord.ButtonStyle.success)
+    async def double_btn(self, interaction, button):
+        game = self.game
+        if len(game.player) != 2:
+            await interaction.response.send_message("❌ You can only double on your first move.", ephemeral=True)
+            return
+        if not econ.spend(game.guild_id, game.user_id, game.bet):
+            await interaction.response.send_message("❌ You don't have enough fries to double.", ephemeral=True)
+            return
+        game.bet *= 2
+        game.player.append(draw_card())
+        await self._end(interaction)
+
+    async def on_timeout(self):
+        if self.game.finished:
+            return
+        self.game.settle()  # walked away: the hand stands
+        if self.message is not None:
+            try:
+                await self.message.edit(embed=blackjack_embed(self.game), view=None)
+            except discord.HTTPException:
+                pass
+
+
+@bot.tree.command(name="blackjack", description="Play a hand of blackjack against the dealer (3:2 on blackjack)")
+@app_commands.describe(amount="A number, 1k, 2.5m, half or all")
+@app_commands.guild_only()
+async def blackjack_cmd(interaction: discord.Interaction, amount: str):
+    key = (interaction.guild.id, interaction.user.id)
+    if key in bj_active:
+        await interaction.response.send_message("❌ Finish your current blackjack hand first.", ephemeral=True)
+        return
+    bet = await take_bet(interaction, amount)
+    if bet is None:
+        return
+    game = BlackjackGame(key[0], key[1], interaction.user.display_name, bet)
+    bj_active.add(key)
+    if is_blackjack(game.player):
+        game.settle_natural()
+        await interaction.response.send_message(embed=blackjack_embed(game))
+        return
+    view = BlackjackView(game)
+    await interaction.response.send_message(embed=blackjack_embed(game), view=view)
+    view.message = await interaction.original_response()
+
+
+# ----- CS2-style cases -----
+def case_list_embed():
+    embed = econ_embed(
+        "📦 Cases",
+        "Odds are the real in-game ones: 🟦 79.92%  🟪 15.98%  🌸 3.2%  🟥 0.64%  🟨 0.26%\n"
+        f"Open with `/open`. Cases pay back about {int(CASE_RTP * 100)}% of their price on average.",
+    )
+    for c in CASES.values():
+        best = max((v, n) for lst in c["items"].values() for n, v in lst)
+        embed.add_field(name=f"{c['emoji']} {c['name']}",
+                        value=f"Price: **{money(c['price'])}**\nTop prize: {best[1]}", inline=False)
+    return embed
+
+
+@bot.tree.command(name="cases", description="See the cases you can open")
+@app_commands.guild_only()
+async def cases_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=case_list_embed())
+
+
+class CaseResultView(discord.ui.View):
+    def __init__(self, owner_id, case_key, item_id, value):
+        super().__init__(timeout=90)
+        self.owner_id, self.case_key, self.item_id = owner_id, case_key, item_id
+        self.message = None
+        self.sell_btn.label = f"Sell for {value:,}"
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ That's not your drop.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Sell", emoji="💰", style=discord.ButtonStyle.success)
+    async def sell_btn(self, interaction, button):
+        g, u = interaction.guild.id, interaction.user.id
+        got = econ.sell_item(g, u, self.item_id)
+        if got is None:
+            await interaction.response.send_message("❌ You already sold that.", ephemeral=True)
+            return
+        button.disabled, button.label = True, "Sold"
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(f"💰 Sold for **{money(got)}**. Balance: {money(econ.balance(g, u))}", ephemeral=True)
+
+    @discord.ui.button(label="Open again", emoji="🔁", style=discord.ButtonStyle.primary)
+    async def again_btn(self, interaction, button):
+        await open_case_flow(interaction, self.case_key, 1)
+
+    async def on_timeout(self):
+        if self.message is not None:
+            try:
+                await self.message.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+
+def spin_embed(title, description, color=POTATO_COLOR):
+    embed = econ_embed(title, description, color)
+    if CASE_SPIN_GIF:
+        embed.set_image(url=CASE_SPIN_GIF)
+    return embed
+
+
+def drop_embed(item, case, item_id, opening=False):
+    name, color, emoji = RARITIES[item["rarity"]][0], RARITIES[item["rarity"]][1], RARITIES[item["rarity"]][2]
+    embed = discord.Embed(title=f"{emoji} {name}", description=f"**{display_name(item)}**", color=color)
+    embed.add_field(name="Float", value=f"`{item['wear_float']:.4f}`")
+    embed.add_field(name="Value", value=money(item["value"]))
+    embed.add_field(name="Item ID", value=f"`#{item_id}`")
+    embed.set_footer(text=f"{case['name']} • saved to your /inventory")
+    if item["rarity"] == "gold":
+        embed.description = "🎉🎉 **RARE SPECIAL ITEM!** 🎉🎉\n" + embed.description
+        if CASE_GOLD_GIF:
+            embed.set_image(url=CASE_GOLD_GIF)
+    return embed
+
+
+async def open_case_flow(interaction, case_key, count):
+    case = CASES[case_key]
+    g, u = interaction.guild.id, interaction.user.id
+    cost = case["price"] * count
+    if not econ.spend(g, u, cost):
+        await interaction.response.send_message(
+            f"❌ {count} × {case['name']} costs **{money(cost)}** and you have {money(econ.balance(g, u))}.", ephemeral=True)
+        return
+    drops = []
+    for _ in range(count):  # rolled and saved BEFORE any animation, so nothing is lost if Discord hiccups
+        item = roll_item(case_key)
+        drops.append((item, econ.add_item(g, u, item)))
+
+    if count > 1:
+        drops.sort(key=lambda d: -d[0]["value"])
+        total = sum(d[0]["value"] for d in drops)
+        lines = [f"{RARITIES[i['rarity']][2]} {md_safe(display_name(i, short=True))} — {money(i['value'])} `#{iid}`"
+                 for i, iid in drops]
+        best = drops[0][0]
+        net = total - cost
+        embed = econ_embed(f"{case['emoji']} Opened {count}× {case['name']}", "\n".join(lines),
+                           RARITIES[best["rarity"]][1])
+        embed.add_field(name="Spent", value=money(cost))
+        embed.add_field(name="Drops worth", value=money(total))
+        embed.add_field(name="Net", value=f"{'+' if net >= 0 else '-'}{abs(net):,} {CURRENCY}")
+        if CASE_GOLD_GIF and any(d[0]["rarity"] == "gold" for d in drops):
+            embed.set_image(url=CASE_GOLD_GIF)
+        await interaction.response.send_message(embed=embed)
+        return
+
+    item, item_id = drops[0]
+    pool = [n for lst in case["items"].values() for n, _ in lst]
+    await interaction.response.send_message(embed=spin_embed(f"{case['emoji']} Opening {case['name']}...", "🔑 *unlocking...*"))
+    for _ in range(4):
+        await asyncio.sleep(0.7)
+        a, b, c = random.sample(pool, 3)
+        rcolor = RARITIES[random.choice(list(RARITIES))][1]
+        await interaction.edit_original_response(
+            embed=spin_embed(f"{case['emoji']} Opening {case['name']}...", f"{a}\n➡️ **{b}** ⬅️\n{c}", rcolor))
+    await asyncio.sleep(0.7)
+    view = CaseResultView(u, case_key, item_id, item["value"])
+    await interaction.edit_original_response(embed=drop_embed(item, case, item_id), view=view)
+    view.message = await interaction.original_response()
+
+
+@bot.tree.command(name="open", description="Open a CS2-style case")
+@app_commands.describe(case_name="Which case", count=f"How many to open at once (1-{MAX_CASES_AT_ONCE})")
+@app_commands.rename(case_name="case")
+@app_commands.choices(case_name=CASE_CHOICES)
+@app_commands.guild_only()
+@app_commands.checks.cooldown(1, 3.0)
+async def open_cmd(interaction: discord.Interaction, case_name: str,
+                   count: app_commands.Range[int, 1, MAX_CASES_AT_ONCE] = 1):
+    await open_case_flow(interaction, case_name, count)
+
+
+@bot.tree.command(name="inventory", description="Your skins, most valuable first")
+@app_commands.describe(page="Page number", user="Whose inventory (default: yours)")
+@app_commands.guild_only()
+async def inventory_cmd(interaction: discord.Interaction, page: app_commands.Range[int, 1, 1000] = 1,
+                        user: Optional[discord.Member] = None):
+    target = user or interaction.user
+    g, per = interaction.guild.id, 12
+    count, value = econ.inventory_stats(g, target.id)
+    if not count:
+        await interaction.response.send_message(f"📭 {md_safe(target.display_name)} has no skins yet. Try `/open`!", ephemeral=True)
+        return
+    pages = (count + per - 1) // per
+    page = min(page, pages)
+    rows = econ.items(g, target.id, per, (page - 1) * per)
+    lines = [f"`#{r['id']}` {RARITIES[r['rarity']][2]} {md_safe(display_name(r, short=True))} — {money(r['value'])}"
+             for r in rows]
+    embed = econ_embed(f"🎒 {md_safe(target.display_name)}'s inventory", "\n".join(lines))
+    embed.set_footer(text=f"{count} item(s) worth {value:,} fries • page {page}/{pages} • sell with /sell <id>")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="sell", description="Sell one skin from your inventory")
+@app_commands.describe(item_id="The # number shown in /inventory")
+@app_commands.guild_only()
+async def sell_cmd(interaction: discord.Interaction, item_id: int):
+    g, u = interaction.guild.id, interaction.user.id
+    got = econ.sell_item(g, u, item_id)
+    if got is None:
+        await interaction.response.send_message("❌ You don't have an item with that ID.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"💰 Sold for **{money(got)}**. Balance: {money(econ.balance(g, u))}")
+
+
+@bot.tree.command(name="sellall", description="Sell all skins of a rarity (red and gold are never sold in bulk)")
+@app_commands.describe(tier="Which skins to sell")
+@app_commands.choices(tier=[
+    app_commands.Choice(name="Mil-Spec (blue)", value="blue"),
+    app_commands.Choice(name="Restricted (purple)", value="purple"),
+    app_commands.Choice(name="Classified (pink)", value="pink"),
+    app_commands.Choice(name="All blue + purple", value="bluepurple"),
+])
+@app_commands.guild_only()
+async def sellall_cmd(interaction: discord.Interaction, tier: str):
+    g, u = interaction.guild.id, interaction.user.id
+    rarities = ["blue", "purple"] if tier == "bluepurple" else [tier]
+    count, total = econ.sell_rarities(g, u, rarities)
+    if not count:
+        await interaction.response.send_message("❌ You have nothing like that to sell.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"💰 Sold **{count}** skin(s) for **{money(total)}**. Balance: {money(econ.balance(g, u))}")
+
+
+# ----- admin -----
+@bot.command()
+@is_admin()
+async def ffgive(ctx, member: discord.Member, amount: int):
+    """Give (or take, with a negative number) fries from a player."""
+    econ.give(ctx.guild.id, member.id, amount)
+    await reply(ctx, f"{CURRENCY} {member.display_name} now has **{money(econ.balance(ctx.guild.id, member.id))}**.")
+
 
 
 # --- EVENTS ---
