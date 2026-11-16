@@ -1068,6 +1068,7 @@ ADMIN_COMMANDS = [
         ("!ffsetwater <0-100>", "Set hydration to an exact value (also revives)"),
         ("!ffsay <text>", "Make the potato say something (deletes your message)"),
         ("!ffgive @user <amount>", "Give fries to a player (negative amount takes them away)"),
+        ("!ffsync", "Re-register the slash commands and list them (shows Discord's error if it refuses)"),
     ]),
     ("🧠 AI & memory", [
         ("!ffmodel [list|add|remove|first|reset] [provider/model]", "Manage the model fallback order"),
@@ -3476,6 +3477,25 @@ async def ffgive(ctx, member: discord.Member, amount: int):
     """Give (or take, with a negative number) fries from a player."""
     econ.give(ctx.guild.id, member.id, amount)
     await reply(ctx, f"{CURRENCY} {member.display_name} now has **{money(econ.balance(ctx.guild.id, member.id))}**.")
+
+
+@bot.command()
+@is_admin()
+async def ffsync(ctx):
+    """Re-register the slash commands with Discord and list them (shows the exact error if Discord refuses)."""
+    try:
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            where = f"to server {GUILD_ID} (instant)"
+        else:
+            synced = await bot.tree.sync()
+            where = "globally (can take a few minutes to show up)"
+        names = ", ".join(f"/{c.name}" for c in synced)
+        await reply(ctx, f"✅ Synced **{len(synced)}** slash command(s) {where}:\n{names}"[:1900])
+    except Exception as e:
+        await reply(ctx, f"❌ Sync failed: `{type(e).__name__}`\n```{str(e)[:1500]}```")
 
 
 
