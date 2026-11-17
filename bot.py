@@ -523,7 +523,7 @@ def get_identity(long_mode=False, avoid_opener=None, search=False):
     style = (
         "Start by answering the user's message directly. Never open with thanks or gratitude; "
         "if you feel thankful, mention it only occasionally, in the middle of a reply. "
-        "Vary how you begin each reply."
+        "Always reply in the same language the user wrote in (any language) and switch whenever they switch or ask you to. Vary how you begin each reply."
     )
     if avoid_opener:
         style += f" Your last reply began with '{avoid_opener}', so begin differently this time."
@@ -531,8 +531,9 @@ def get_identity(long_mode=False, avoid_opener=None, search=False):
     if search:
         live += (
             "For anything that changes over time (news, scores, prices, weather, or anything 'latest' or "
-            "'current') use your web search tool instead of guessing, then answer naturally without "
-            "mentioning the tool. Don't search for small talk or things you already know."
+            "'current'), AND for anything you don't know or aren't sure about (people, facts, products, events, "
+            "slang you don't recognise), use your web search tool instead of guessing or making things up, then "
+            "answer naturally without mentioning the tool. Don't search for small talk or things you clearly know."
         )
     else:
         live += (
@@ -1049,12 +1050,21 @@ USER_COMMANDS = [
         ("/skip  /pause  /resume  /stop", "Control playback"),
         ("/leave", "Disconnect the bot from voice"),
     ]),
-    ("🎰 Casino & Cases (fake fries only)", [
-        ("/balance  /daily  /work  /pay", "Check your fries, claim a daily streak bonus, earn hourly, pay a friend"),
+    ("🎰 Casino & Cases (fake potatoes only)", [
+        ("/balance  /daily  /work  /pay", "Check your potatoes, claim a daily streak bonus, work a shift every 5 min, pay a friend"),
         ("/cases  /open", "Open CS2-style cases (real in-game odds), animated reveal"),
-        ("/inventory  /sell  /sellall", "View your skins and sell them for fries"),
-        ("/coinflip  /slots  /roulette  /blackjack", "Gamble your fries"),
+        ("/inventory  /sell  /sellall", "View your skins and sell them for potatoes"),
+        ("/coinflip  /slots  /roulette  /blackjack", "Gamble your potatoes"),
         ("/leaderboard", "Richest players in this server"),
+    ]),
+    ("🛒 Shop & Businesses", [
+        ("/shop  /buy  /assets", "Weapons, real estate, cars and businesses (max 3). Properties pay rent on every /work"),
+        ("/collect", "Take the passive income your businesses earned"),
+        ("/bounce-flex", "Own the Bouncing Maybach? Flex it for 200 🥔 every hour"),
+    ]),
+    ("🔫 Crime", [
+        ("/rob", "Rob a player: a stronger weapon wins, same tier is a 50/50 gunfight. Then lay low for 15 min"),
+        ("/launder", "Wash the dirty 🥔 you stole through a car wash or nightclub"),
     ]),
     ("ℹ️ Help", [
         ("/cmd", "Show this panel"),
@@ -1067,7 +1077,9 @@ ADMIN_COMMANDS = [
         ("!ffkill", "Kill the potato instantly"),
         ("!ffsetwater <0-100>", "Set hydration to an exact value (also revives)"),
         ("!ffsay <text>", "Make the potato say something (deletes your message)"),
-        ("!ffgive @user <amount>", "Give fries to a player (negative amount takes them away)"),
+        ("!ffgive @user <amount>", "Give potatoes to a player (negative amount takes them away)"),
+        ("/cmda-give  /cmda-take", "Give or take potatoes (slash version of !ffgive)"),
+        ("/cmda-item <user id> <item>", "Give any shop item to a Discord user ID"),
         ("!ffsync", "Re-register the slash commands and list them (shows Discord's error if it refuses)"),
     ]),
     ("🧠 AI & memory", [
@@ -2521,39 +2533,37 @@ async def leave_cmd(interaction: discord.Interaction):
 
 
 # =============================================================================
-#  ECONOMY + CASINO  (fake currency only: fries have no real-world value and can't be cashed out)
+#  ECONOMY + CASINO  (fake currency only: potatoes have no real-world value and can't be cashed out)
 #  Storage is SQLite. On Render's free plan the disk is wiped on every redeploy/restart, so balances reset
 #  then. Point ECONOMY_DB at a persistent disk path (e.g. /var/data/potato.db) to keep them.
 # =============================================================================
-CURRENCY = "🍟"
+CURRENCY = "🥔"
 ECON_DB_PATH = os.getenv("ECONOMY_DB", "potato_economy.db")
 try:
     MAX_BET = max(1, int(os.getenv("MAX_BET", "1000000")))
 except ValueError:
     MAX_BET = 1_000_000
-START_BALANCE = 1000
+START_BALANCE = 0           # everyone starts broke: /daily and /work are how you get going
 DAILY_BASE = 500
 DAILY_STREAK_BONUS = 50      # extra per streak day...
 DAILY_STREAK_MAX = 10        # ...up to this many days
-WORK_COOLDOWN = 3600
+WORK_COOLDOWN = 300          # 5 minutes between shifts
 MAX_CASES_AT_ONCE = 10
 
 
-def _gif_setting(name):
-    """A DIRECT image link from the environment (ends in .gif / static.klipy.com...). Page links don't render."""
-    url = (os.getenv(name) or "").strip()
-    if not url:
-        return ""
-    if not url.lower().startswith(("http://", "https://")) or re.match(
-            r"https?://(?:www\.)?klipy\.com/(?:gifs|clips|stickers)/", url, re.IGNORECASE):
-        print(f"⚠️ {name} must be a DIRECT image link (right-click the GIF > Copy image address), "
-              f"not a klipy.com page link: ignoring it")
+def _gif_setting(name, default):
+    """A link that is posted as plain message text: Discord turns it into the GIF by itself.
+    Override with an environment variable of the same name (an empty value is ignored)."""
+    url = (os.getenv(name) or default or "").strip()
+    if url and not url.lower().startswith(("http://", "https://")):
+        print(f"⚠️ {name} must start with http:// or https:// : ignoring it")
         return ""
     return url
 
 
-CASE_SPIN_GIF = _gif_setting("CASE_SPIN_GIF")  # shown while a case spins, removed when the drop is revealed
-CASE_GOLD_GIF = _gif_setting("CASE_GOLD_GIF")  # shown on the reveal when the drop is gold
+CASE_SPIN_GIF = _gif_setting("CASE_SPIN_GIF", "https://klipy.com/gifs/ohne-pixel-cs-go")  # while a case spins
+CASE_GOLD_GIF = _gif_setting("CASE_GOLD_GIF", "https://klipy.com/gifs/ohnepixel-gold")    # on a gold drop
+BOUNCE_GIF = _gif_setting("BOUNCE_GIF", "https://klipy.com/gifs/car-maybach")             # sent by /bounce-flex
 
 # ---------- CS2-style cases ----------
 # Rarity odds are the real in-game case odds. Item lists, wear weights and fry values are this bot's own
@@ -2803,8 +2813,167 @@ def fmt_wait(seconds):
     return f"{h}h {m}m" if h else (f"{m}m" if m else f"{seconds}s")
 
 
+# ---------- shop ----------
+BOUNCE_REWARD = 200
+BOUNCE_COOLDOWN = 3600    # seconds between /bounce-flex uses
+RENT_DIVISOR = 2400       # a property pays price/2400 extra on every /work (work is every 5 min: ~200 hours to pay back)
+MAX_BUSINESSES = 3
+MAX_PEELERS = 5           # the Potato Peeler is single-use, so you can stock a few
+INCOME_CAP_HOURS = 24     # businesses store at most this much income until you /collect
+LAY_LOW_SECONDS = 900     # 15 minutes after any robbery attempt: no working, no buying, no robbing
+ROB_MIN = 50              # victims with less than this in their wallet aren't worth robbing
+ROB_CAPS = {1: 300, 2: 1500, 3: 4000, 4: 10000, 5: 30000, 6: 100000}  # max loot per robbery, by weapon tier
+STIFF_CHANCE = 0.08       # chance a boss refuses to pay after the shift
+WORK_PAY = {"min": (12, 28), "decent": (50, 95)}
+
+SHOP_CATEGORIES = {
+    "weapons": ("🔫", "Weapons"),
+    "estate": ("🏠", "Real estate"),
+    "cars": ("🚗", "Cars"),
+    "business": ("💼", "Businesses (max 3)"),
+}
+SHOP = {
+    # --- weapons: the higher the tier the better. Used to /rob. Same tier = 50/50 gunfight, lower tier = you lose.
+    "peeler":    {"name": "Potato Peeler", "emoji": "✂️", "category": "weapons", "tier": 1, "price": 100,
+                  "consumable": True, "desc": "Cheap and desperate. It breaks after one robbery."},
+    "knife":     {"name": "Knife", "emoji": "🔪", "category": "weapons", "tier": 2, "price": 250,
+                  "desc": "Old school mugging."},
+    "glock":     {"name": "Glock-18", "emoji": "🔫", "category": "weapons", "tier": 3, "price": 400,
+                  "desc": "A reliable pistol."},
+    "launcher":  {"name": "Potato Launcher", "emoji": "🚀", "category": "weapons", "tier": 4, "price": 1200,
+                  "desc": "Spud cannon. Loud and effective."},
+    "ak47":      {"name": "AK-47", "emoji": "🔫", "category": "weapons", "tier": 5, "price": 2500,
+                  "desc": "Old faithful."},
+    "dlore":     {"name": "AWP | Dragon Lore", "emoji": "🐉", "category": "weapons", "tier": 6, "price": 20000,
+                  "desc": "The ultimate weapon."},
+    # --- real estate: flex + rent on every /work
+    "studio":    {"name": "Studio Apartment", "emoji": "🏢", "category": "estate", "price": 5000,
+                  "desc": "Small, cozy, yours."},
+    "house":     {"name": "Suburban House", "emoji": "🏡", "category": "estate", "price": 25000,
+                  "desc": "A garage, a lawn, no mortgage."},
+    "penthouse": {"name": "Penthouse", "emoji": "🌆", "category": "estate", "price": 120000,
+                  "desc": "The whole top floor."},
+    "island":    {"name": "Private Island", "emoji": "🏝️", "category": "estate", "price": 750000,
+                  "desc": "Potato palms included."},
+    # --- cars: flex (the Maybach also unlocks /bounce-flex)
+    "civic":     {"name": "Honda Civic", "emoji": "🚗", "category": "cars", "price": 2500,
+                  "desc": "Cheap, fast enough, never dies."},
+    "charger":   {"name": "Dodge Charger Hellcat", "emoji": "🏎️", "category": "cars", "price": 25000,
+                  "desc": "Supercharged muscle."},
+    "escalade":  {"name": "Cadillac Escalade-V", "emoji": "🚙", "category": "cars", "price": 125000,
+                  "desc": "Supercharged V8 luxury SUV."},
+    "maybach":   {"name": "Bouncing Maybach", "emoji": "🚘", "category": "cars", "price": 200000,
+                  "desc": "Hydraulics and good taste."},
+    # --- businesses (you can own 3): the first two launder dirty potatoes, the big ones earn passive income
+    "carwash":    {"name": "Spud Car Wash", "emoji": "🚿", "category": "business", "price": 10000,
+                   "launder": {"per_day": 10000, "fee": 0.25}, "desc": "A front for washing dirty cash."},
+    "nightclub":  {"name": "Potato Nightclub", "emoji": "🪩", "category": "business", "price": 40000,
+                   "launder": {"per_day": 60000, "fee": 0.15}, "desc": "Cash-heavy and no questions asked."},
+    "factory":    {"name": "Spud Chip Factory", "emoji": "🏭", "category": "business", "price": 50000,
+                   "income": 400, "desc": "Chips, chips, chips."},
+    "restaurant": {"name": "Fry Restaurant Chain", "emoji": "🍟", "category": "business", "price": 150000,
+                   "income": 1300, "desc": "Franchises in every town."},
+    "distillery": {"name": "Potato Vodka Distillery", "emoji": "🥃", "category": "business", "price": 400000,
+                   "income": 3600, "desc": "Premium spirits from humble spuds."},
+}
+
+
+def rent_for(key):
+    item = SHOP[key]
+    return max(1, item["price"] // RENT_DIVISOR) if item["category"] == "estate" else 0
+
+
+def perk_text(key):
+    it = SHOP[key]
+    cat = it["category"]
+    if cat == "weapons":
+        return f"tier {it['tier']} weapon for /rob" + (", single use" if it.get("consumable") else "")
+    if cat == "estate":
+        return f"+{rent_for(key):,} {CURRENCY} on every /work"
+    if cat == "business":
+        if "launder" in it:
+            return f"launders dirty {CURRENCY}: up to {it['launder']['per_day']:,}/day, {round(it['launder']['fee'] * 100)}% cut"
+        return f"earns {it['income']:,} {CURRENCY}/hour, /collect up to {INCOME_CAP_HOURS}h"
+    if key == "maybach":
+        return f"unlocks /bounce-flex: +{BOUNCE_REWARD} {CURRENCY} every {BOUNCE_COOLDOWN // 3600}h"
+    return "pure flex"
+
+
+def rob_outcome(rtier, vtier, rng=random):
+    """win: victim's weapon is weaker (or they have none). reverse: theirs is stronger. Same tier: 50/50 gunfight."""
+    if vtier < rtier:
+        return "win"
+    if vtier > rtier:
+        return "reverse"
+    return "fight_win" if rng.random() < 0.5 else "fight_lose"
+
+
+# ---------- work: 15 workplaces, either minimum wage or properly paid (nothing "middle class") ----------
+WORKPLACES = [
+    {"name": "Fry Shack", "emoji": "🍟", "pay": "min", "job": "flipped fries through the lunch rush",
+     "stiff": "The manager says the register 'came up short' again, so nobody gets paid today."},
+    {"name": "Chez Spud Diner", "emoji": "🍽️", "pay": "min", "job": "washed a mountain of dishes",
+     "stiff": "The owner says you 'broke too many plates' and keeps your wages."},
+    {"name": "Sparkle Car Wash", "emoji": "🧽", "pay": "min", "job": "scrubbed cars all shift",
+     "stiff": "The boss says the water bill 'ate all the profit'."},
+    {"name": "Old MacPotato's Farm", "emoji": "🚜", "pay": "min", "job": "picked potatoes under the sun",
+     "stiff": "The farmer waves from his tractor, drives off, and doesn't come back."},
+    {"name": "the Gas Station", "emoji": "⛽", "pay": "min", "job": "covered the night shift at the counter",
+     "stiff": "The clerk says the safe 'won't open' and the owner will 'settle up next week'."},
+    {"name": "Downtown Parking Lot", "emoji": "🅿️", "pay": "min", "job": "ran the parking booth",
+     "stiff": "The cash box is empty and so are the owner's promises."},
+    {"name": "Mega Mall", "emoji": "🧹", "pay": "min", "job": "mopped the entire food court",
+     "stiff": "Management says the cleaning budget was cut... retroactively."},
+    {"name": "Pizza Palace", "emoji": "🛵", "pay": "min", "job": "delivered pizzas across town",
+     "stiff": "The shop says your tips ARE your pay. There were no tips."},
+    {"name": "a Billionaire's Yacht", "emoji": "🛥️", "pay": "decent", "job": "polished the deck of a mega-yacht",
+     "stiff": "The billionaire's assistant says the yacht already sailed, with your paycheck on board."},
+    {"name": "a Tycoon's Private Kitchen", "emoji": "👨‍🍳", "pay": "decent", "job": "cooked a tasting menu for a tycoon",
+     "stiff": "The tycoon claims the soufflé fell and refuses to pay for failure."},
+    {"name": "the High-Roller Casino", "emoji": "🎰", "pay": "decent", "job": "dealt cards in the VIP room",
+     "stiff": "The pit boss says the casino had a bad night, so wages are 'on the house'."},
+    {"name": "a Blockbuster Movie Set", "emoji": "🎬", "pay": "decent", "job": "did stunts for a big action movie",
+     "stiff": "The studio says your pay is 'in post-production' indefinitely."},
+    {"name": "a Celebrity Security Detail", "emoji": "🕶️", "pay": "decent", "job": "guarded a celebrity at a premiere",
+     "stiff": "The celebrity's manager says 'the check is in the mail'."},
+    {"name": "Sky High Helicopters", "emoji": "🚁", "pay": "decent", "job": "flew tourists over the city",
+     "stiff": "The company filed for bankruptcy this morning. Funny timing."},
+    {"name": "the Five-Star Hotel", "emoji": "🛎️", "pay": "decent", "job": "worked the concierge desk of a luxury hotel",
+     "stiff": "The hotel says 'exposure' counts as compensation here."},
+]
+
+
+# ---------- case spin: fast at first, then gradually slower ----------
+SPIN_DELAYS = [0.45, 0.45, 0.5, 0.55, 0.65, 0.8, 1.0, 1.25, 1.55]  # seconds before each frame
+REEL_WINDOW = 5                                                     # items visible at once
+FILLER_WEIGHTS = [("blue", 50), ("purple", 25), ("pink", 14), ("red", 8), ("gold", 3)]
+
+
+def build_reel(case_key, drop_name, drop_rarity, frames=None, rng=random):
+    """The strip of items that scrolls past. The window shown on the LAST frame is centred on the real drop."""
+    frames = frames or len(SPIN_DELAYS)
+    items = CASES[case_key]["items"]
+    rarities, weights = zip(*FILLER_WEIGHTS)
+    reel = []
+    for _ in range(frames + REEL_WINDOW - 1):
+        rar = rng.choices(rarities, weights=weights)[0]
+        reel.append((rng.choice(items[rar])[0], rar))
+    reel[frames + REEL_WINDOW // 2 - 1] = (drop_name, drop_rarity)
+    return reel
+
+
 # ---------- database ----------
 class EconomyDB:
+    # Columns added to databases created by older versions of the bot (so nobody's balance is lost on update)
+    USER_COLUMNS = {
+        "last_bounce": "REAL NOT NULL DEFAULT 0",
+        "dirty": "INTEGER NOT NULL DEFAULT 0",          # stolen potatoes: must be laundered before they can be spent
+        "lay_low_until": "REAL NOT NULL DEFAULT 0",
+        "last_collect": "REAL NOT NULL DEFAULT 0",      # business income is paid from this moment
+        "launder_start": "REAL NOT NULL DEFAULT 0",     # start of the current 24h laundering window
+        "launder_used": "INTEGER NOT NULL DEFAULT 0",
+    }
+
     def __init__(self, path):
         self.lock = threading.RLock()
         self.conn = sqlite3.connect(path, check_same_thread=False)
@@ -2824,8 +2993,20 @@ class EconomyDB:
                     wear_float REAL NOT NULL, stattrak INTEGER NOT NULL DEFAULT 0,
                     value INTEGER NOT NULL, case_key TEXT NOT NULL, created REAL NOT NULL);
                 CREATE INDEX IF NOT EXISTS idx_items_owner ON items (guild_id, user_id);
+                CREATE TABLE IF NOT EXISTS assets (
+                    guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                    item_key TEXT NOT NULL, bought REAL NOT NULL,
+                    PRIMARY KEY (guild_id, user_id, item_key));
             """)
+            self._add_missing_columns("users", self.USER_COLUMNS)
+            self._add_missing_columns("assets", {"qty": "INTEGER NOT NULL DEFAULT 1"})
             self.conn.commit()
+
+    def _add_missing_columns(self, table, columns):
+        have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+        for name, ddl in columns.items():
+            if name not in have:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     def q(self, sql, args=(), one=False):
         with self.lock:
@@ -2845,12 +3026,23 @@ class EconomyDB:
         self.ensure(g, u)
         return self.q("SELECT balance FROM users WHERE guild_id=? AND user_id=?", (g, u), one=True)["balance"]
 
+    def dirty_balance(self, g, u):
+        self.ensure(g, u)
+        return self.q("SELECT dirty FROM users WHERE guild_id=? AND user_id=?", (g, u), one=True)["dirty"]
+
+    def lay_low_left(self, g, u, now=None):
+        """Seconds of 'peacetime' left after a robbery (0 = free to act)."""
+        now = time.time() if now is None else now
+        self.ensure(g, u)
+        until = self.q("SELECT lay_low_until FROM users WHERE guild_id=? AND user_id=?", (g, u), one=True)["lay_low_until"]
+        return max(0.0, until - now)
+
     def add(self, g, u, amount):
         self.ensure(g, u)
         self.x("UPDATE users SET balance = balance + ? WHERE guild_id=? AND user_id=?", (int(amount), g, u))
 
     def give(self, g, u, amount):
-        """Admin: add (or take, with a negative number) fries; never goes below 0."""
+        """Admin: add (or take, with a negative number) potatoes; never goes below 0."""
         self.ensure(g, u)
         self.x("UPDATE users SET balance = MAX(0, balance + ?) WHERE guild_id=? AND user_id=?", (int(amount), g, u))
 
@@ -2890,16 +3082,233 @@ class EconomyDB:
         return True, reward, streak, 0
 
     def claim_work(self, g, u, now=None, rng=random):
-        """Returns (claimed, reward, seconds_to_wait)."""
+        """Returns (status, info). status: 'ok' | 'cooldown' | 'laylow'.
+        On 'ok' info has: place, pay, stiffed (the boss refused to pay), rent (from owned real estate)."""
         now = time.time() if now is None else now
-        self.ensure(g, u)
-        last = self.q("SELECT last_work FROM users WHERE guild_id=? AND user_id=?", (g, u), one=True)["last_work"]
-        if last and now - last < WORK_COOLDOWN:
-            return False, 0, last + WORK_COOLDOWN - now
-        reward = rng.randint(80, 200)
-        self.x("UPDATE users SET balance = balance + ?, last_work=? WHERE guild_id=? AND user_id=?", (reward, now, g, u))
-        return True, reward, 0
+        with self.lock:
+            self.ensure(g, u)
+            row = self.conn.execute("SELECT last_work, lay_low_until FROM users WHERE guild_id=? AND user_id=?",
+                                    (g, u)).fetchone()
+            if row["lay_low_until"] > now:
+                return "laylow", {"wait": row["lay_low_until"] - now}
+            if row["last_work"] and now - row["last_work"] < WORK_COOLDOWN:
+                return "cooldown", {"wait": row["last_work"] + WORK_COOLDOWN - now}
+            place = rng.choice(WORKPLACES)
+            low, high = WORK_PAY[place["pay"]]
+            stiffed = rng.random() < STIFF_CHANCE
+            pay = 0 if stiffed else rng.randint(low, high)
+            rent = self.property_rent(g, u)
+            self.conn.execute("UPDATE users SET balance = balance + ?, last_work=? WHERE guild_id=? AND user_id=?",
+                              (pay + rent, now, g, u))
+            self.conn.commit()
+            return "ok", {"place": place, "pay": pay, "stiffed": stiffed, "rent": rent}
 
+    # ----- shop / assets -----
+    def owned(self, g, u):
+        """{item_key: quantity}"""
+        rows = self.q("SELECT item_key, qty FROM assets WHERE guild_id=? AND user_id=? AND qty > 0", (g, u))
+        return {r["item_key"]: r["qty"] for r in rows}
+
+    def has_asset(self, g, u, key):
+        return key in self.owned(g, u)
+
+    def property_rent(self, g, u):
+        return sum(rent_for(k) for k in self.owned(g, u) if k in SHOP)
+
+    def best_weapon(self, g, u):
+        """Key of the strongest weapon someone owns, or None."""
+        best = None
+        for k in self.owned(g, u):
+            it = SHOP.get(k)
+            if it and it["category"] == "weapons" and (best is None or it["tier"] > SHOP[best]["tier"]):
+                best = k
+        return best
+
+    def _income_rate(self, g, u):
+        return sum(SHOP[k]["income"] for k in self.owned(g, u) if k in SHOP and "income" in SHOP[k])
+
+    def _settle_income(self, g, u, now):
+        """Pay the income earned so far and restart the clock. The caller commits."""
+        rate = self._income_rate(g, u)
+        last = self.conn.execute("SELECT last_collect FROM users WHERE guild_id=? AND user_id=?", (g, u)).fetchone()["last_collect"]
+        paid = 0
+        if rate and last:
+            paid = int(rate * min(max(0.0, now - last) / 3600, INCOME_CAP_HOURS))
+        self.conn.execute("UPDATE users SET balance = balance + ?, last_collect=? WHERE guild_id=? AND user_id=?",
+                          (paid, now, g, u))
+        return paid
+
+    def _grant(self, g, u, key, now):
+        """Put an item in someone's assets (the caller holds the lock and commits/rolls back).
+        Returns 'ok', 'owned' (already have it, or carrying the max) or 'limit' (3 businesses already)."""
+        it = SHOP[key]
+        have = self.owned(g, u)
+        if it.get("consumable"):
+            if have.get(key, 0) >= MAX_PEELERS:
+                return "owned"
+            if key in have:
+                self.conn.execute("UPDATE assets SET qty = qty + 1 WHERE guild_id=? AND user_id=? AND item_key=?", (g, u, key))
+            else:
+                self.conn.execute("INSERT OR REPLACE INTO assets (guild_id, user_id, item_key, bought, qty) VALUES (?, ?, ?, ?, 1)",
+                                  (g, u, key, now))
+            return "ok"
+        if key in have:
+            return "owned"
+        if it["category"] == "business":
+            if sum(1 for k in have if k in SHOP and SHOP[k]["category"] == "business") >= MAX_BUSINESSES:
+                return "limit"
+            if "income" in it:
+                self._settle_income(g, u, now)  # income earned so far is paid; the new business starts earning now
+        self.conn.execute("INSERT OR REPLACE INTO assets (guild_id, user_id, item_key, bought, qty) VALUES (?, ?, ?, ?, 1)",
+                          (g, u, key, now))
+        return "ok"
+
+    def buy_asset(self, g, u, key, price, now=None):
+        """Returns 'ok', 'owned', 'limit' or 'poor'. The payment and the purchase happen together or not at all."""
+        now = time.time() if now is None else now
+        with self.lock:
+            self.ensure(g, u)
+            status = self._grant(g, u, key, now)
+            if status != "ok":
+                self.conn.rollback()
+                return status
+            cur = self.conn.execute(
+                "UPDATE users SET balance = balance - ? WHERE guild_id=? AND user_id=? AND balance >= ?",
+                (price, g, u, price))
+            if cur.rowcount != 1:
+                self.conn.rollback()
+                return "poor"
+            self.conn.commit()
+            return "ok"
+
+    def grant_asset(self, g, u, key, now=None):
+        """Admin: give an item for free. Returns 'ok', 'owned' or 'limit'."""
+        now = time.time() if now is None else now
+        with self.lock:
+            self.ensure(g, u)
+            status = self._grant(g, u, key, now)
+            if status == "ok":
+                self.conn.commit()
+            else:
+                self.conn.rollback()
+            return status
+
+    def claim_bounce(self, g, u, now=None):
+        """Returns ('ok'|'noasset'|'cooldown', seconds_to_wait). Needs the Bouncing Maybach."""
+        now = time.time() if now is None else now
+        with self.lock:
+            self.ensure(g, u)
+            if not self.has_asset(g, u, "maybach"):
+                return "noasset", 0
+            last = self.conn.execute("SELECT last_bounce FROM users WHERE guild_id=? AND user_id=?",
+                                     (g, u)).fetchone()["last_bounce"]
+            if last and now - last < BOUNCE_COOLDOWN:
+                return "cooldown", last + BOUNCE_COOLDOWN - now
+            self.conn.execute("UPDATE users SET balance = balance + ?, last_bounce=? WHERE guild_id=? AND user_id=?",
+                              (BOUNCE_REWARD, now, g, u))
+            self.conn.commit()
+            return "ok", 0
+
+    # ----- businesses -----
+    def collect_income(self, g, u, now=None):
+        """Returns (status, paid, rate_per_hour, hours_stored). status: 'ok' | 'nobiz' | 'empty'."""
+        now = time.time() if now is None else now
+        with self.lock:
+            self.ensure(g, u)
+            rate = self._income_rate(g, u)
+            if not rate:
+                return "nobiz", 0, 0, 0.0
+            last = self.conn.execute("SELECT last_collect FROM users WHERE guild_id=? AND user_id=?",
+                                     (g, u)).fetchone()["last_collect"] or now
+            hours = max(0.0, now - last) / 3600
+            paid = int(rate * min(hours, INCOME_CAP_HOURS))
+            if paid <= 0:
+                return "empty", 0, rate, hours
+            self.conn.execute("UPDATE users SET balance = balance + ?, last_collect=? WHERE guild_id=? AND user_id=?",
+                              (paid, now, g, u))
+            self.conn.commit()
+            return "ok", paid, rate, hours
+
+    def launder(self, g, u, amount, now=None):
+        """Wash dirty potatoes into clean ones through the laundering businesses you own.
+        Returns (status, info). status: 'ok' | 'nobiz' | 'nodirty' | 'capped'."""
+        now = time.time() if now is None else now
+        with self.lock:
+            self.ensure(g, u)
+            fronts = [SHOP[k]["launder"] for k in self.owned(g, u) if k in SHOP and "launder" in SHOP[k]]
+            if not fronts:
+                return "nobiz", {}
+            per_day = sum(f["per_day"] for f in fronts)
+            fee = min(f["fee"] for f in fronts)
+            row = self.conn.execute("SELECT dirty, launder_start, launder_used FROM users WHERE guild_id=? AND user_id=?",
+                                    (g, u)).fetchone()
+            start, used = row["launder_start"], row["launder_used"]
+            if not start or now - start >= 86400:
+                start, used = now, 0
+            remaining = per_day - used
+            if row["dirty"] <= 0:
+                return "nodirty", {}
+            if remaining <= 0:
+                return "capped", {"wait": start + 86400 - now, "per_day": per_day}
+            washed = min(int(amount), row["dirty"], remaining)
+            if washed <= 0:
+                return "nodirty", {}
+            cut = int(washed * fee)
+            clean = washed - cut
+            self.conn.execute(
+                "UPDATE users SET dirty = dirty - ?, balance = balance + ?, launder_start=?, launder_used=? "
+                "WHERE guild_id=? AND user_id=?", (washed, clean, start, used + washed, g, u))
+            self.conn.commit()
+            return "ok", {"washed": washed, "clean": clean, "cut": cut, "fee": fee,
+                          "remaining": remaining - washed, "per_day": per_day}
+
+    # ----- robbery -----
+    def rob(self, g, robber, victim, now=None, rng=random):
+        """One robbery attempt, all-or-nothing. Returns a dict with 'status':
+        'laylow' | 'noweapon' | 'broke' | 'done'. After 'done' the robber must lay low for 15 minutes.
+        Stolen potatoes are DIRTY (they land in the robber's dirty balance and must be laundered)."""
+        now = time.time() if now is None else now
+        with self.lock:
+            self.ensure(g, robber)
+            self.ensure(g, victim)
+            r = self.conn.execute("SELECT balance, dirty, lay_low_until FROM users WHERE guild_id=? AND user_id=?",
+                                  (g, robber)).fetchone()
+            if r["lay_low_until"] > now:
+                return {"status": "laylow", "wait": r["lay_low_until"] - now}
+            rkey = self.best_weapon(g, robber)
+            if rkey is None:
+                return {"status": "noweapon"}
+            vbal = self.conn.execute("SELECT balance FROM users WHERE guild_id=? AND user_id=?",
+                                     (g, victim)).fetchone()["balance"]
+            if vbal < ROB_MIN:
+                return {"status": "broke", "balance": vbal}
+            vkey = self.best_weapon(g, victim)
+            rtier = SHOP[rkey]["tier"]
+            vtier = SHOP[vkey]["tier"] if vkey else 0
+            outcome = rob_outcome(rtier, vtier, rng)
+            if outcome in ("win", "fight_win"):
+                amount = max(1, min(int(vbal * rng.uniform(0.10, 0.30)), ROB_CAPS[rtier]))
+                self.conn.execute("UPDATE users SET balance = balance - ? WHERE guild_id=? AND user_id=?", (amount, g, victim))
+                self.conn.execute("UPDATE users SET dirty = dirty + ? WHERE guild_id=? AND user_id=?", (amount, g, robber))
+            else:  # reverse robbery: the victim takes from YOU (clean potatoes first, then dirty ones)
+                pool = r["balance"] + r["dirty"]
+                amount = min(int(pool * rng.uniform(0.15, 0.30)), ROB_CAPS[vtier])
+                from_clean = min(r["balance"], amount)
+                from_dirty = amount - from_clean
+                if amount:
+                    self.conn.execute("UPDATE users SET balance = balance - ?, dirty = dirty - ? WHERE guild_id=? AND user_id=?",
+                                      (from_clean, from_dirty, g, robber))
+                    self.conn.execute("UPDATE users SET balance = balance + ? WHERE guild_id=? AND user_id=?", (amount, g, victim))
+            if rkey == "peeler":  # single use: it's gone whether you won or not
+                self.conn.execute("UPDATE assets SET qty = qty - 1 WHERE guild_id=? AND user_id=? AND item_key='peeler'", (g, robber))
+                self.conn.execute("DELETE FROM assets WHERE guild_id=? AND user_id=? AND item_key='peeler' AND qty <= 0", (g, robber))
+            self.conn.execute("UPDATE users SET lay_low_until=? WHERE guild_id=? AND user_id=?",
+                              (now + LAY_LOW_SECONDS, g, robber))
+            self.conn.commit()
+            return {"status": "done", "outcome": outcome, "amount": amount, "rkey": rkey, "vkey": vkey,
+                    "rtier": rtier, "vtier": vtier}
+
+    # ----- skins -----
     def add_item(self, g, u, item):
         cur = self.x(
             "INSERT INTO items (guild_id, user_id, name, rarity, wear, wear_float, stattrak, value, case_key, created)"
@@ -2918,7 +3327,7 @@ class EconomyDB:
         return row["c"], row["v"]
 
     def sell_item(self, g, u, item_id):
-        """Sell one item you own. Returns the fries received, or None if it isn't yours / already sold."""
+        """Sell one item you own. Returns the potatoes received, or None if it isn't yours / already sold."""
         with self.lock:
             self.ensure(g, u)
             row = self.conn.execute("SELECT value FROM items WHERE id=? AND guild_id=? AND user_id=?",
@@ -2932,7 +3341,7 @@ class EconomyDB:
             return row["value"]
 
     def sell_rarities(self, g, u, rarities):
-        """Sell every item of the given rarities. Returns (count, fries)."""
+        """Sell every item of the given rarities. Returns (count, potatoes)."""
         marks = ",".join("?" for _ in rarities)
         with self.lock:
             self.ensure(g, u)
@@ -2967,7 +3376,7 @@ econ = open_economy()
 
 
 # ---------- Discord side ----------
-CASE_CHOICES = [app_commands.Choice(name=f"{c['name']} - {c['price']:,} fries", value=k) for k, c in CASES.items()]
+CASE_CHOICES = [app_commands.Choice(name=f"{c['name']} - {c['price']:,} potatoes", value=k) for k, c in CASES.items()]
 JOBS = [
     "peeled potatoes at the fry shack", "flipped burgers next to the fryer", "delivered sacks of spuds",
     "washed dishes at a diner", "sold ketchup door to door", "harvested a field of potatoes",
@@ -2994,7 +3403,7 @@ async def take_bet(interaction, amount_text):
 
 
 # ----- basics -----
-@bot.tree.command(name="balance", description="Check your fries (or someone else's)")
+@bot.tree.command(name="balance", description="Check your potatoes (or someone else's)")
 @app_commands.describe(user="Whose balance to check (default: you)")
 @app_commands.guild_only()
 async def balance_cmd(interaction: discord.Interaction, user: Optional[discord.Member] = None):
@@ -3003,11 +3412,17 @@ async def balance_cmd(interaction: discord.Interaction, user: Optional[discord.M
     count, value = econ.inventory_stats(g, target.id)
     embed = econ_embed(f"{CURRENCY} {target.display_name}", None)
     embed.add_field(name="Balance", value=money(econ.balance(g, target.id)))
-    embed.add_field(name="Inventory", value=f"{count} item(s) worth {money(value)}")
+    dirty = econ.dirty_balance(g, target.id)
+    if dirty:
+        embed.add_field(name="🧼 Dirty (launder it first)", value=money(dirty))
+    embed.add_field(name="Skins", value=f"{count} item(s) worth {money(value)}")
+    wait = econ.lay_low_left(g, target.id)
+    if wait:
+        embed.add_field(name="🤫 Laying low", value=f"{fmt_wait(wait)} left", inline=False)
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="daily", description="Claim your daily fries (streaks give a bonus)")
+@bot.tree.command(name="daily", description="Claim your daily potatoes (streaks give a bonus)")
 @app_commands.guild_only()
 async def daily_cmd(interaction: discord.Interaction):
     g, u = interaction.guild.id, interaction.user.id
@@ -3020,21 +3435,33 @@ async def daily_cmd(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="work", description="Do a quick job for fries (once an hour)")
+@bot.tree.command(name="work", description="Work a shift for potatoes (every 5 minutes... if your boss actually pays)")
 @app_commands.guild_only()
 async def work_cmd(interaction: discord.Interaction):
     g, u = interaction.guild.id, interaction.user.id
-    ok, reward, wait = econ.claim_work(g, u)
-    if not ok:
-        await interaction.response.send_message(f"⏳ You're tired. Work again in **{fmt_wait(wait)}**.", ephemeral=True)
+    status, info = econ.claim_work(g, u)
+    if status == "laylow":
+        await interaction.response.send_message(
+            f"🤫 You must lay low for a while. You can't work for another **{fmt_wait(info['wait'])}**.", ephemeral=True)
         return
+    if status == "cooldown":
+        await interaction.response.send_message(f"⏳ You're tired. Work again in **{fmt_wait(info['wait'])}**.", ephemeral=True)
+        return
+    place = info["place"]
+    rent = f"\n🏠 Rent from your properties: **+{money(info['rent'])}**" if info["rent"] else ""
+    if info["stiffed"]:
+        text = (f"{place['emoji']} You {place['job']} at **{place['name']}**.\n"
+                f"💀 {place['stiff']}\nYou earned **{money(0)}**.")
+        color = 0xED4245
+    else:
+        text = f"{place['emoji']} You {place['job']} at **{place['name']}** and earned **{money(info['pay'])}**."
+        color = POTATO_COLOR
     await interaction.response.send_message(
-        f"💼 You {random.choice(JOBS)} and earned **{money(reward)}**. Balance: {money(econ.balance(g, u))}"
-    )
+        embed=econ_embed("💼 Shift report", f"{text}{rent}\nBalance: {money(econ.balance(g, u))}", color))
 
 
-@bot.tree.command(name="pay", description="Give some of your fries to another player")
-@app_commands.describe(user="Who gets the fries", amount="A number, 1k, 2.5m, half or all")
+@bot.tree.command(name="pay", description="Give some of your potatoes to another player")
+@app_commands.describe(user="Who gets the potatoes", amount="A number, 1k, 2.5m, half or all")
 @app_commands.guild_only()
 async def pay_cmd(interaction: discord.Interaction, user: discord.Member, amount: str):
     g, u = interaction.guild.id, interaction.user.id
@@ -3046,7 +3473,7 @@ async def pay_cmd(interaction: discord.Interaction, user: discord.Member, amount
         await interaction.response.send_message(f"❌ {err}", ephemeral=True)
         return
     if not econ.transfer(g, u, user.id, bet):
-        await interaction.response.send_message("❌ You don't have enough fries.", ephemeral=True)
+        await interaction.response.send_message("❌ You don't have enough potatoes.", ephemeral=True)
         return
     await interaction.response.send_message(f"💸 {interaction.user.mention} paid {user.mention} **{money(bet)}**.")
 
@@ -3056,7 +3483,7 @@ async def pay_cmd(interaction: discord.Interaction, user: discord.Member, amount
 async def leaderboard_cmd(interaction: discord.Interaction):
     rows = econ.leaderboard(interaction.guild.id, 10)
     if not rows:
-        await interaction.response.send_message("Nobody has any fries yet. Try `/daily`!", ephemeral=True)
+        await interaction.response.send_message("Nobody has any potatoes yet. Try `/daily`!", ephemeral=True)
         return
     medals = ["🥇", "🥈", "🥉"]
     lines = []
@@ -3204,7 +3631,7 @@ def blackjack_embed(game):
         embed.add_field(name="Result", value=f"{text}\nBalance: {money(econ.balance(game.guild_id, game.user_id))}",
                         inline=False)
     else:
-        embed.set_footer(text=f"Bet: {game.bet:,} fries  •  Hit, Stand, or Double (first move only)")
+        embed.set_footer(text=f"Bet: {game.bet:,} potatoes  •  Hit, Stand, or Double (first move only)")
     return embed
 
 
@@ -3245,7 +3672,7 @@ class BlackjackView(discord.ui.View):
             await interaction.response.send_message("❌ You can only double on your first move.", ephemeral=True)
             return
         if not econ.spend(game.guild_id, game.user_id, game.bet):
-            await interaction.response.send_message("❌ You don't have enough fries to double.", ephemeral=True)
+            await interaction.response.send_message("❌ You don't have enough potatoes to double.", ephemeral=True)
             return
         game.bet *= 2
         game.player.append(draw_card())
@@ -3340,11 +3767,17 @@ class CaseResultView(discord.ui.View):
                 pass
 
 
+def reel_embed(title, window):
+    mid = len(window) // 2
+    lines = []
+    for j, (name, rar) in enumerate(window):
+        tag = f"{RARITIES[rar][2]} {name}"
+        lines.append(f"➡️ **{tag}** ⬅️" if j == mid else f"▫️ {tag}")
+    return spin_embed(title, "\n".join(lines), RARITIES[window[mid][1]][1])
+
+
 def spin_embed(title, description, color=POTATO_COLOR):
-    embed = econ_embed(title, description, color)
-    if CASE_SPIN_GIF:
-        embed.set_image(url=CASE_SPIN_GIF)
-    return embed
+    return econ_embed(title, description, color)
 
 
 def drop_embed(item, case, item_id, opening=False):
@@ -3356,8 +3789,6 @@ def drop_embed(item, case, item_id, opening=False):
     embed.set_footer(text=f"{case['name']} • saved to your /inventory")
     if item["rarity"] == "gold":
         embed.description = "🎉🎉 **RARE SPECIAL ITEM!** 🎉🎉\n" + embed.description
-        if CASE_GOLD_GIF:
-            embed.set_image(url=CASE_GOLD_GIF)
     return embed
 
 
@@ -3386,23 +3817,22 @@ async def open_case_flow(interaction, case_key, count):
         embed.add_field(name="Spent", value=money(cost))
         embed.add_field(name="Drops worth", value=money(total))
         embed.add_field(name="Net", value=f"{'+' if net >= 0 else '-'}{abs(net):,} {CURRENCY}")
-        if CASE_GOLD_GIF and any(d[0]["rarity"] == "gold" for d in drops):
-            embed.set_image(url=CASE_GOLD_GIF)
-        await interaction.response.send_message(embed=embed)
+        gold_link = CASE_GOLD_GIF if CASE_GOLD_GIF and any(d[0]["rarity"] == "gold" for d in drops) else None
+        await interaction.response.send_message(content=gold_link, embed=embed)
         return
 
     item, item_id = drops[0]
-    pool = [n for lst in case["items"].values() for n, _ in lst]
-    await interaction.response.send_message(embed=spin_embed(f"{case['emoji']} Opening {case['name']}...", "🔑 *unlocking...*"))
-    for _ in range(4):
-        await asyncio.sleep(0.7)
-        a, b, c = random.sample(pool, 3)
-        rcolor = RARITIES[random.choice(list(RARITIES))][1]
-        await interaction.edit_original_response(
-            embed=spin_embed(f"{case['emoji']} Opening {case['name']}...", f"{a}\n➡️ **{b}** ⬅️\n{c}", rcolor))
-    await asyncio.sleep(0.7)
+    title = f"{case['emoji']} Opening {case['name']}..."
+    reel = build_reel(case_key, item["name"], item["rarity"])
+    await interaction.response.send_message(content=CASE_SPIN_GIF or None, embed=spin_embed(title, "🔑 *unlocking...*"))
+    for k, delay in enumerate(SPIN_DELAYS):  # quick at first, each frame a little slower than the last
+        await asyncio.sleep(delay)
+        await interaction.edit_original_response(embed=reel_embed(title, reel[k:k + REEL_WINDOW]))
+    await asyncio.sleep(1.0)  # the reel has stopped on the drop; hold it for a beat, then reveal (GIF disappears)
     view = CaseResultView(u, case_key, item_id, item["value"])
-    await interaction.edit_original_response(embed=drop_embed(item, case, item_id), view=view)
+    gold_link = CASE_GOLD_GIF if item["rarity"] == "gold" and CASE_GOLD_GIF else None
+    # content=None removes the spin GIF link, so the GIF disappears; a gold drop swaps in the gold GIF link instead
+    await interaction.edit_original_response(content=gold_link, embed=drop_embed(item, case, item_id), view=view)
     view.message = await interaction.original_response()
 
 
@@ -3434,7 +3864,7 @@ async def inventory_cmd(interaction: discord.Interaction, page: app_commands.Ran
     lines = [f"`#{r['id']}` {RARITIES[r['rarity']][2]} {md_safe(display_name(r, short=True))} — {money(r['value'])}"
              for r in rows]
     embed = econ_embed(f"🎒 {md_safe(target.display_name)}'s inventory", "\n".join(lines))
-    embed.set_footer(text=f"{count} item(s) worth {value:,} fries • page {page}/{pages} • sell with /sell <id>")
+    embed.set_footer(text=f"{count} item(s) worth {value:,} potatoes • page {page}/{pages} • sell with /sell <id>")
     await interaction.response.send_message(embed=embed)
 
 
@@ -3470,11 +3900,281 @@ async def sellall_cmd(interaction: discord.Interaction, tier: str):
         f"💰 Sold **{count}** skin(s) for **{money(total)}**. Balance: {money(econ.balance(g, u))}")
 
 
+# ----- shop -----
+SHOP_CHOICES = [app_commands.Choice(name=f"{i['emoji']} {i['name']} - {i['price']:,}", value=k) for k, i in SHOP.items()]
+CATEGORY_CHOICES = [app_commands.Choice(name="Everything", value="all")] + [
+    app_commands.Choice(name=label, value=k) for k, (_, label) in SHOP_CATEGORIES.items()]
+
+
+def shop_embed(g, u, category="all"):
+    owned = econ.owned(g, u)
+    embed = econ_embed("🛒 Potato Shop",
+                       f"Your balance: **{money(econ.balance(g, u))}**\nBuy with `/buy`. Everything you buy is yours for good.")
+    for cat, (emoji, label) in SHOP_CATEGORIES.items():
+        if category not in ("all", cat):
+            continue
+        lines = []
+        for key, it in SHOP.items():
+            if it["category"] == cat:
+                tag = ("  🎒 carrying **%d**" % owned[key] if it.get("consumable") else "  ✅ **owned**") if key in owned else ""
+                lines.append(f"{it['emoji']} **{it['name']}** — {money(it['price'])}{tag}\n└ {it['desc']} *({perk_text(key)})*")
+        embed.add_field(name=f"{emoji} {label}", value="\n".join(lines), inline=False)
+    return embed
+
+
+@bot.tree.command(name="shop", description="Browse weapons, real estate, cars and businesses")
+@app_commands.describe(category="Which section to show")
+@app_commands.choices(category=CATEGORY_CHOICES)
+@app_commands.guild_only()
+async def shop_cmd(interaction: discord.Interaction, category: str = "all"):
+    await interaction.response.send_message(embed=shop_embed(interaction.guild.id, interaction.user.id, category))
+
+
+@bot.tree.command(name="buy", description="Buy something from the shop")
+@app_commands.describe(item="What to buy")
+@app_commands.choices(item=SHOP_CHOICES)
+@app_commands.guild_only()
+async def buy_cmd(interaction: discord.Interaction, item: str):
+    g, u = interaction.guild.id, interaction.user.id
+    it = SHOP[item]
+    wait = econ.lay_low_left(g, u)
+    if wait:
+        await interaction.response.send_message(
+            f"🤫 You must lay low for a while. You can't buy anything for another **{fmt_wait(wait)}**.", ephemeral=True)
+        return
+    result = econ.buy_asset(g, u, item, it["price"])
+    if result == "owned":
+        msg = (f"❌ You're already carrying the maximum ({MAX_PEELERS}) **{it['name']}s**." if it.get("consumable")
+               else f"❌ You already own the **{it['name']}**.")
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+    if result == "limit":
+        await interaction.response.send_message(f"❌ You can only own **{MAX_BUSINESSES}** businesses.", ephemeral=True)
+        return
+    if result == "poor":
+        missing = it["price"] - econ.balance(g, u)
+        await interaction.response.send_message(
+            f"❌ The **{it['name']}** costs {money(it['price'])}. You need **{money(missing)}** more.", ephemeral=True)
+        return
+    note = f"\n{perk_text(item).capitalize()}."
+    if item == "maybach":
+        note += " Try `/bounce-flex`!"
+    await interaction.response.send_message(embed=econ_embed(
+        f"{it['emoji']} Purchased: {it['name']}",
+        f"You paid **{money(it['price'])}**.{note}\nBalance: {money(econ.balance(g, u))}", 0x57F287))
+
+
+@bot.tree.command(name="assets", description="See the weapons, properties, cars and businesses someone owns")
+@app_commands.describe(user="Whose assets (default: yours)")
+@app_commands.guild_only()
+async def assets_cmd(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    target = user or interaction.user
+    g = interaction.guild.id
+    owned = econ.owned(g, target.id)
+    if not owned:
+        await interaction.response.send_message(
+            f"📭 {md_safe(target.display_name)} doesn't own anything yet. Check the `/shop`!", ephemeral=True)
+        return
+    embed = econ_embed(f"🏆 {md_safe(target.display_name)}'s assets", None)
+    for cat, (emoji, label) in SHOP_CATEGORIES.items():
+        lines = [f"{it['emoji']} **{it['name']}**" + (f" ×{owned[key]}" if owned[key] > 1 else "")
+                 for key, it in SHOP.items() if it["category"] == cat and key in owned]
+        if lines:
+            embed.add_field(name=f"{emoji} {label}", value="\n".join(lines), inline=False)
+    notes = []
+    rent = econ.property_rent(g, target.id)
+    if rent:
+        notes.append(f"Rent: +{rent:,} potatoes on every /work")
+    if notes:
+        embed.set_footer(text="  •  ".join(notes))
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="bounce-flex", description=f"Flex your Bouncing Maybach for {BOUNCE_REWARD} potatoes (once an hour)")
+@app_commands.guild_only()
+async def bounce_flex_cmd(interaction: discord.Interaction):
+    g, u = interaction.guild.id, interaction.user.id
+    status, wait = econ.claim_bounce(g, u)
+    if status == "noasset":
+        await interaction.response.send_message(
+            f"🚫 You need to own the **Bouncing Maybach** ({money(SHOP['maybach']['price'])}). Check the `/shop`!", ephemeral=True)
+        return
+    if status == "cooldown":
+        await interaction.response.send_message(
+            f"⏳ The hydraulics are cooling down. Flex again in **{fmt_wait(wait)}**.", ephemeral=True)
+        return
+    embed = econ_embed("🚘 BOUNCE FLEX",
+                       f"**{md_safe(interaction.user.display_name)}** pulls up in the Bouncing Maybach...\n"
+                       f"💸 **+{money(BOUNCE_REWARD)}**\nBalance: {money(econ.balance(g, u))}", 0xFFD700)
+    await interaction.response.send_message(content=BOUNCE_GIF or None, embed=embed)  # the link becomes the GIF
+
+
+# ----- crime: robbing, dirty potatoes, laundering -----
+@bot.tree.command(name="rob", description="Rob a player with your best weapon, then lay low for 15 minutes")
+@app_commands.describe(user="Who to rob")
+@app_commands.guild_only()
+async def rob_cmd(interaction: discord.Interaction, user: discord.Member):
+    g, u = interaction.guild.id, interaction.user.id
+    if user.bot or user.id == u:
+        await interaction.response.send_message("❌ Pick another (human) player.", ephemeral=True)
+        return
+    res = econ.rob(g, u, user.id)
+    status = res["status"]
+    if status == "laylow":
+        await interaction.response.send_message(
+            f"🤫 You must lay low for a while. ({fmt_wait(res['wait'])} left)", ephemeral=True)
+        return
+    if status == "noweapon":
+        await interaction.response.send_message(
+            "❌ You need a weapon to rob someone. Check the `/shop` (the Potato Peeler is cheap).", ephemeral=True)
+        return
+    if status == "broke":
+        await interaction.response.send_message(
+            f"❌ **{md_safe(user.display_name)}** has almost nothing worth stealing.", ephemeral=True)
+        return
+    rw = SHOP[res["rkey"]]
+    vw = SHOP[res["vkey"]] if res["vkey"] else None
+    robber, victim = md_safe(interaction.user.display_name), md_safe(user.display_name)
+    amount = money(res["amount"])
+    outcome = res["outcome"]
+    if outcome == "win":
+        title, color = "🔫 Robbery successful", 0x57F287
+        text = (f"**{robber}** held up **{victim}** with a **{rw['name']}** "
+                f"({'they had a ' + vw['name'] if vw else 'they had no weapon'}).\n"
+                f"You grabbed **{amount}**. It's 🧼 dirty, so `/launder` it.")
+    elif outcome == "fight_win":
+        title, color = "💥 Gunfight won!", 0x57F287
+        text = (f"**{victim}** had a **{vw['name']}**, the same tier as your **{rw['name']}**. "
+                f"A 50/50 gunfight... you won!\nYou took **{amount}**. It's 🧼 dirty, so `/launder` it.")
+    elif outcome == "fight_lose":
+        title, color = "💥 Gunfight lost", 0xED4245
+        text = (f"**{victim}** had a **{vw['name']}**, the same tier as your **{rw['name']}**. "
+                f"A 50/50 gunfight... you lost!\n" + (f"**{victim}** took **{amount}** from you." if res["amount"]
+                                                       else "You had nothing to lose, this time."))
+    else:
+        title, color = "😬 Reverse robbed!", 0xED4245
+        text = (f"**{victim}** pulled out a **{vw['name']}**, stronger than your **{rw['name']}**!\n"
+                + (f"You got reverse robbed and lost **{amount}**." if res["amount"]
+                   else "You had nothing to lose, this time."))
+    notes = ["🤫 You must lay low for a while: no working or buying for 15 minutes."]
+    if res["rkey"] == "peeler":
+        notes.append("✂️ Your Potato Peeler is used up.")
+    embed = econ_embed(title, text, color)
+    embed.set_footer(text="  ".join(notes))
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="launder", description="Wash dirty potatoes into clean ones (needs a car wash or a nightclub)")
+@app_commands.describe(amount="A number, 1k, half or all (default: all)")
+@app_commands.guild_only()
+async def launder_cmd(interaction: discord.Interaction, amount: str = "all"):
+    g, u = interaction.guild.id, interaction.user.id
+    dirty = econ.dirty_balance(g, u)
+    if dirty <= 0:
+        await interaction.response.send_message("🧼 You don't have any dirty potatoes. Robberies make them.", ephemeral=True)
+        return
+    want = parse_amount(amount, dirty)
+    if want is None or want < 1:
+        await interaction.response.send_message("❌ Use a number, `1k`, `half` or `all`.", ephemeral=True)
+        return
+    status, info = econ.launder(g, u, want)
+    if status == "nobiz":
+        await interaction.response.send_message(
+            f"❌ You need a laundering business: the **{SHOP['carwash']['name']}** or the **{SHOP['nightclub']['name']}**. "
+            "See `/shop business`.", ephemeral=True)
+        return
+    if status == "capped":
+        await interaction.response.send_message(
+            f"⏳ Your businesses already washed their daily limit ({info['per_day']:,} {CURRENCY}). "
+            f"Try again in **{fmt_wait(info['wait'])}**.", ephemeral=True)
+        return
+    if status != "ok":
+        await interaction.response.send_message("❌ Nothing to wash.", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=econ_embed(
+        "🧼 Laundered",
+        f"Washed **{money(info['washed'])}** of dirty potatoes.\n"
+        f"The {round(info['fee'] * 100)}% cut: **{money(info['cut'])}**\n"
+        f"Clean potatoes received: **{money(info['clean'])}**\n"
+        f"Left to wash today: {money(info['remaining'])}\nBalance: {money(econ.balance(g, u))}", 0x57F287))
+
+
+@bot.tree.command(name="collect", description="Collect the passive income from your businesses")
+@app_commands.guild_only()
+async def collect_cmd(interaction: discord.Interaction):
+    g, u = interaction.guild.id, interaction.user.id
+    status, paid, rate, hours = econ.collect_income(g, u)
+    if status == "nobiz":
+        await interaction.response.send_message(
+            f"❌ You don't own an income business. The **{SHOP['factory']['name']}** starts at {money(SHOP['factory']['price'])}. "
+            "See `/shop business`.", ephemeral=True)
+        return
+    if status == "empty":
+        await interaction.response.send_message("⏳ Nothing to collect yet. Come back in a bit!", ephemeral=True)
+        return
+    full = " (storage was full: it only holds 24 hours)" if hours > INCOME_CAP_HOURS else ""
+    await interaction.response.send_message(
+        f"💼 Collected **{money(paid)}** from your businesses ({min(hours, INCOME_CAP_HOURS):.1f}h at "
+        f"{rate:,} {CURRENCY}/hour){full}. Balance: {money(econ.balance(g, u))}")
+
+
 # ----- admin -----
+# ----- admin -----
+async def admin_adjust(interaction, user, amount, give):
+    if interaction.user.id != ADMIN_ID:
+        await interaction.response.send_message("🚫 Admins only.", ephemeral=True)
+        return
+    g = interaction.guild.id
+    before = econ.balance(g, user.id)
+    econ.give(g, user.id, amount if give else -amount)
+    after = econ.balance(g, user.id)
+    verb = f"gave **{money(after - before)}** to" if give else f"took **{money(before - after)}** from"
+    await interaction.response.send_message(f"🛠️ {interaction.user.mention} {verb} {user.mention}. "
+                                            f"Their balance: **{money(after)}**")
+
+
+@bot.tree.command(name="cmda-give", description="Admin: give potatoes to a player")
+@app_commands.describe(user="Who gets them", amount="How many potatoes")
+@app_commands.guild_only()
+async def cmda_give(interaction: discord.Interaction, user: discord.Member,
+                    amount: app_commands.Range[int, 1, 1_000_000_000]):
+    await admin_adjust(interaction, user, amount, give=True)
+
+
+@bot.tree.command(name="cmda-take", description="Admin: take potatoes from a player")
+@app_commands.describe(user="Who to take from", amount="How many potatoes")
+@app_commands.guild_only()
+async def cmda_take(interaction: discord.Interaction, user: discord.Member,
+                    amount: app_commands.Range[int, 1, 1_000_000_000]):
+    await admin_adjust(interaction, user, amount, give=False)
+
+
+@bot.tree.command(name="cmda-item", description="Admin: give any shop item to a Discord user ID")
+@app_commands.describe(user_id="The user's Discord ID (an @mention works too)", item="Which item to give")
+@app_commands.choices(item=SHOP_CHOICES)
+@app_commands.guild_only()
+async def cmda_item(interaction: discord.Interaction, user_id: str, item: str):
+    if interaction.user.id != ADMIN_ID:
+        await interaction.response.send_message("🚫 Admins only.", ephemeral=True)
+        return
+    digits = re.sub(r"\D", "", user_id)
+    if not 15 <= len(digits) <= 20:
+        await interaction.response.send_message("❌ That doesn't look like a Discord user ID.", ephemeral=True)
+        return
+    uid, it = int(digits), SHOP[item]
+    status = econ.grant_asset(interaction.guild.id, uid, item)
+    msg = {
+        "ok": f"🎁 Gave **{it['name']}** to <@{uid}>.",
+        "owned": f"❌ <@{uid}> already has the **{it['name']}**.",
+        "limit": f"❌ <@{uid}> already owns {MAX_BUSINESSES} businesses.",
+    }[status]
+    await interaction.response.send_message(msg, ephemeral=(status != "ok"))
+
+
 @bot.command()
 @is_admin()
 async def ffgive(ctx, member: discord.Member, amount: int):
-    """Give (or take, with a negative number) fries from a player."""
+    """Give (or take, with a negative number) potatoes from a player."""
     econ.give(ctx.guild.id, member.id, amount)
     await reply(ctx, f"{CURRENCY} {member.display_name} now has **{money(econ.balance(ctx.guild.id, member.id))}**.")
 
