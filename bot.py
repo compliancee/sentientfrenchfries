@@ -2775,6 +2775,29 @@ def blackjack_settle(player, dealer, bet):
     return "lose", 0
 
 
+def render_cards(cards, hide_second=False, per_row=5):
+    """Playing cards drawn in a code block so every hand lines up like real cards. Cards look like 'K♥' or '10♠'."""
+    faces = []
+    for i, c in enumerate(cards):
+        rank, suit = c[:-1], c[-1]
+        faces.append(None if (hide_second and i == 1) else (rank, suit))
+    rows = []
+    for k in range(0, len(faces), per_row):
+        chunk = faces[k:k + per_row]
+        lines = [[] for _ in range(5)]
+        for f in chunk:
+            lines[0].append("┌─────┐")
+            if f is None:  # the dealer's hidden card
+                lines[1].append("│░░░░░│"); lines[2].append("│░░░░░│"); lines[3].append("│░░░░░│")
+            else:
+                lines[1].append("│" + f[0].ljust(5) + "│")
+                lines[2].append("│" + f[1].center(5) + "│")
+                lines[3].append("│" + f[0].rjust(5) + "│")
+            lines[4].append("└─────┘")
+        rows.extend(" ".join(line) for line in lines)
+    return "```\n" + "\n".join(rows) + "\n```"
+
+
 # ---------- amounts ----------
 def parse_amount(text, balance):
     t = str(text).strip().lower().replace(",", "").replace("_", "")
@@ -2804,6 +2827,17 @@ def parse_bet(text, balance):
 
 def money(n):
     return f"{int(n):,} {CURRENCY}"
+
+
+def short_num(n):
+    """1234 -> '1.2K', 2_500_000 -> '2.5M' (used where space is tight, like the leaderboard)."""
+    n = int(n)
+    if abs(n) < 1000:
+        return str(n)
+    for div, suffix in ((1_000, "K"), (1_000_000, "M"), (1_000_000_000, "B")):
+        v = n / div
+        if abs(v) < 999.95 or suffix == "B":  # 999,999 becomes 1M, not 1000K
+            return f"{v:.1f}".rstrip("0").rstrip(".") + suffix
 
 
 def fmt_wait(seconds):
@@ -3356,6 +3390,28 @@ class EconomyDB:
                 self.conn.commit()
             return row["c"], row["v"]
 
+    def standings(self, g):
+        """Everyone with something, richest first, with a breakdown. Returns (rows, summary).
+        worth = wallet + value of skins + shop price of owned assets (dirty potatoes don't count)."""
+        users = self.q("SELECT user_id, balance FROM users WHERE guild_id=?", (g,))
+        skins = {r["user_id"]: r["v"] for r in self.q(
+            "SELECT user_id, COALESCE(SUM(value), 0) AS v FROM items WHERE guild_id=? GROUP BY user_id", (g,))}
+        assets = {}
+        for r in self.q("SELECT user_id, item_key, qty FROM assets WHERE guild_id=? AND qty > 0", (g,)):
+            if r["item_key"] in SHOP:
+                assets[r["user_id"]] = assets.get(r["user_id"], 0) + SHOP[r["item_key"]]["price"] * r["qty"]
+        rows = []
+        for r in users:
+            u = r["user_id"]
+            row = {"user_id": u, "balance": r["balance"], "skins": skins.get(u, 0), "assets": assets.get(u, 0)}
+            row["worth"] = row["balance"] + row["skins"] + row["assets"]
+            if row["worth"] > 0:
+                rows.append(row)
+        rows.sort(key=lambda x: (-x["worth"], x["user_id"]))
+        summary = {"players": len(users), "circulation": sum(r["balance"] for r in users),
+                   "worth": sum(r["worth"] for r in rows)}
+        return rows, summary
+
     def leaderboard(self, g, limit=10):
         """Top players by net worth (balance + inventory value)."""
         return self.q(
@@ -3478,20 +3534,38 @@ async def pay_cmd(interaction: discord.Interaction, user: discord.Member, amount
     await interaction.response.send_message(f"💸 {interaction.user.mention} paid {user.mention} **{money(bet)}**.")
 
 
-@bot.tree.command(name="leaderboard", description="Richest players in this server (balance + inventory)")
+LEADERBOARD_SIZE = 20
+
+
+@bot.tree.command(name="leaderboard", description="The big leaderboard: the richest potatoes in this server")
 @app_commands.guild_only()
 async def leaderboard_cmd(interaction: discord.Interaction):
-    rows = econ.leaderboard(interaction.guild.id, 10)
+    guild = interaction.guild
+    rows, info = econ.standings(guild.id)
     if not rows:
         await interaction.response.send_message("Nobody has any potatoes yet. Try `/daily`!", ephemeral=True)
         return
     medals = ["🥇", "🥈", "🥉"]
     lines = []
-    for i, r in enumerate(rows):
-        member = interaction.guild.get_member(r["user_id"])
-        name = md_safe(member.display_name) if member else f"<@{r['user_id']}>"
-        lines.append(f"{medals[i] if i < 3 else f'`{i + 1}.`'} **{name}** — {money(r['worth'])}")
-    await interaction.response.send_message(embed=econ_embed("🏆 Richest potatoes", "\n".join(lines)))
+    for i, r in enumerate(rows[:LEADERBOARD_SIZE]):
+        member = guild.get_member(r["user_id"])
+        name = md_safe(shorten(member.display_name, 22)) if member else f"<@{r['user_id']}>"
+        rank = medals[i] if i < 3 else f"`{i + 1:>2}.`"
+        lines.append(f"{rank} **{name}** — **{short_num(r['worth'])}** {CURRENCY}\n"
+                     f"┗ 💰 {short_num(r['balance'])} · 🎒 {short_num(r['skins'])} · 🏠 {short_num(r['assets'])}")
+    header = (f"👥 **{info['players']}** players  ·  {CURRENCY} **{short_num(info['circulation'])}** in wallets  ·  "
+              f"💎 **{short_num(info['worth'])}** total net worth")
+    body = "\n".join(lines)
+    while len(header) + len(body) + 20 > 4000 and "\n" in body:  # never exceed Discord's embed size
+        body = body.rsplit("\n", 2)[0]
+    embed = discord.Embed(title=f"🏆 THE BIG LEADERBOARD — {guild.name}"[:250], description=f"{header}\n\n{body}",
+                          color=0xFFD700)
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    mine = next((i + 1 for i, r in enumerate(rows) if r["user_id"] == interaction.user.id), None)
+    embed.set_footer(text=("Net worth = wallet 💰 + skins 🎒 + assets 🏠" +
+                           (f"  •  you're #{mine}" if mine else "  •  you're not on the board yet")))
+    await interaction.response.send_message(embed=embed)
 
 
 # ----- simple games -----
@@ -3607,21 +3681,21 @@ class BlackjackGame:
         bj_active.discard((self.guild_id, self.user_id))
 
 
-def fmt_cards(cards):
-    return "  ".join(f"`{c}`" for c in cards)
-
-
 def blackjack_embed(game):
     reveal = game.finished
-    dealer = fmt_cards(game.dealer) if reveal else f"`{game.dealer[0]}`  `??`"
     dealer_val = hand_value(game.dealer) if reveal else hand_value(game.dealer[:1])
-    embed = discord.Embed(title="🃏 Blackjack", color=POTATO_COLOR)
-    embed.add_field(name=f"Dealer ({dealer_val})", value=dealer, inline=False)
-    embed.add_field(name=f"{game.name} ({hand_value(game.player)})", value=fmt_cards(game.player), inline=False)
+    player_val = hand_value(game.player)
+    embed = discord.Embed(title=f"🃏 Blackjack  •  bet {money(game.bet)}", color=POTATO_COLOR)
+    dealer_tag = "  💥 BUST" if reveal and dealer_val > 21 else ("" if reveal else "  (one card hidden)")
+    embed.add_field(name=f"🎩 Dealer — {dealer_val}{dealer_tag}",
+                    value=render_cards(game.dealer, hide_second=not reveal), inline=False)
+    player_tag = "  💥 BUST" if player_val > 21 else ("  ✨ BLACKJACK" if is_blackjack(game.player) else "")
+    embed.add_field(name=f"🧑 {md_safe(game.name)} — {player_val}{player_tag}",
+                    value=render_cards(game.player), inline=False)
     if game.finished:
         net = game.payout - game.bet
         text, color = {
-            "blackjack": (f"🂡 **Blackjack!** You won **{money(net)}**.", 0x57F287),
+            "blackjack": (f"✨ **Blackjack!** You won **{money(net)}**.", 0x57F287),
             "win": (f"✅ You won **{money(net)}**!", 0x57F287),
             "push": ("🤝 Push. Your bet is returned.", 0x95A5A6),
             "lose": (f"❌ Dealer wins. You lost **{money(game.bet)}**.", 0xED4245),
@@ -3631,7 +3705,7 @@ def blackjack_embed(game):
         embed.add_field(name="Result", value=f"{text}\nBalance: {money(econ.balance(game.guild_id, game.user_id))}",
                         inline=False)
     else:
-        embed.set_footer(text=f"Bet: {game.bet:,} potatoes  •  Hit, Stand, or Double (first move only)")
+        embed.set_footer(text="Hit = another card  •  Stand = keep your hand  •  Double = 2x bet, one card (first move only)")
     return embed
 
 
