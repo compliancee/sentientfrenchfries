@@ -1058,7 +1058,8 @@ USER_COMMANDS = [
         ("/leaderboard", "Richest players in this server"),
     ]),
     ("🛒 Shop & Businesses", [
-        ("/shop  /buy  /assets", "Weapons, real estate, cars and businesses (max 3). Properties pay rent on every /work"),
+        ("/shop  /gunstore  /realestate  /dealership  /businesses", "The mall and its stores: weapons, properties, cars, businesses (max 3)"),
+        ("/buy  /assets", "Buy something, or see what you (or a friend) own. Properties pay rent on every /work"),
         ("/collect", "Take the passive income your businesses earned"),
         ("/bounce-flex", "Own the Bouncing Maybach? Flex it for 200 🥔 every hour"),
     ]),
@@ -3974,34 +3975,122 @@ async def sellall_cmd(interaction: discord.Interaction, tier: str):
         f"💰 Sold **{count}** skin(s) for **{money(total)}**. Balance: {money(econ.balance(g, u))}")
 
 
-# ----- shop -----
+# ----- shop: a mall front page, and one store per category -----
 SHOP_CHOICES = [app_commands.Choice(name=f"{i['emoji']} {i['name']} - {i['price']:,}", value=k) for k, i in SHOP.items()]
-CATEGORY_CHOICES = [app_commands.Choice(name="Everything", value="all")] + [
-    app_commands.Choice(name=label, value=k) for k, (_, label) in SHOP_CATEGORIES.items()]
+
+STORES = {  # category -> how the store is presented. Every store also has its own slash command.
+    "weapons": {"cmd": "gunstore", "label": "Gun Store", "emoji": "🔫",
+                "intro": "No questions asked. A stronger weapon wins a robbery, the same tier is a 50/50 gunfight."},
+    "estate": {"cmd": "realestate", "label": "Real Estate", "emoji": "🏠",
+               "intro": "Flex on everyone. Every property also pays rent on each `/work`."},
+    "cars": {"cmd": "dealership", "label": "Dealership", "emoji": "🚗",
+             "intro": "Pure flex... except the Maybach, which has hydraulics and a `/bounce-flex` for you."},
+    "business": {"cmd": "businesses", "label": "Business Center", "emoji": "💼",
+                 "intro": f"You can own {MAX_BUSINESSES}. Car washes and nightclubs launder dirty potatoes, "
+                          "the big ones pay passive income (cash it out with `/collect`)."},
+}
 
 
-def shop_embed(g, u, category="all"):
+def shop_embed(g, u, page="home"):
     owned = econ.owned(g, u)
-    embed = econ_embed("🛒 Potato Shop",
-                       f"Your balance: **{money(econ.balance(g, u))}**\nBuy with `/buy`. Everything you buy is yours for good.")
-    for cat, (emoji, label) in SHOP_CATEGORIES.items():
-        if category not in ("all", cat):
-            continue
-        lines = []
-        for key, it in SHOP.items():
-            if it["category"] == cat:
-                tag = ("  🎒 carrying **%d**" % owned[key] if it.get("consumable") else "  ✅ **owned**") if key in owned else ""
-                lines.append(f"{it['emoji']} **{it['name']}** — {money(it['price'])}{tag}\n└ {it['desc']} *({perk_text(key)})*")
-        embed.add_field(name=f"{emoji} {label}", value="\n".join(lines), inline=False)
+    balance = money(econ.balance(g, u))
+    if page == "home":
+        embed = econ_embed("🛒 Potato Mall",
+                           f"Your balance: **{balance}**\nPick a store with the buttons below, or jump straight in with its command.")
+        for cat, st in STORES.items():
+            keys = [k for k, it in SHOP.items() if it["category"] == cat]
+            prices = [SHOP[k]["price"] for k in keys]
+            have = sum(1 for k in keys if k in owned)
+            limit = MAX_BUSINESSES if cat == "business" else len(keys)
+            embed.add_field(name=f"{st['emoji']} {st['label']}  —  /{st['cmd']}",
+                            value=f"{len(keys)} items · {money(min(prices))} to {money(max(prices))}\nYou own **{have}/{limit}**",
+                            inline=False)
+        embed.set_footer(text="Buy with /buy  •  See what you own with /assets")
+        return embed
+    st = STORES[page]
+    lines = []
+    for key, it in SHOP.items():
+        if it["category"] == page:
+            tag = ("  🎒 carrying **%d**" % owned[key] if it.get("consumable") else "  ✅ **owned**") if key in owned else ""
+            lines.append(f"{it['emoji']} **{it['name']}** — {money(it['price'])}{tag}\n└ {it['desc']} *({perk_text(key)})*")
+    embed = econ_embed(f"{st['emoji']} {st['label']}", f"{st['intro']}\nYour balance: **{balance}**")
+    embed.add_field(name="For sale", value="\n".join(lines), inline=False)
+    embed.set_footer(text="Buy with /buy  •  Use the buttons to switch stores")
     return embed
 
 
-@bot.tree.command(name="shop", description="Browse weapons, real estate, cars and businesses")
-@app_commands.describe(category="Which section to show")
-@app_commands.choices(category=CATEGORY_CHOICES)
+class ShopView(discord.ui.View):
+    """Buttons under the shop: Overview + one per store. Only the person who opened it can use them."""
+
+    def __init__(self, owner_id, current="home"):
+        super().__init__(timeout=180)
+        self.owner_id, self.current, self.message = owner_id, current, None
+        self._build()
+
+    def _build(self):
+        self.clear_items()
+        pages = [("home", "Overview", "🛒")] + [(cat, st["label"], st["emoji"]) for cat, st in STORES.items()]
+        for key, label, emoji in pages:
+            style = discord.ButtonStyle.primary if key == self.current else discord.ButtonStyle.secondary
+            button = discord.ui.Button(label=label, emoji=emoji, style=style)
+            button.callback = self._open(key)
+            self.add_item(button)
+
+    def _open(self, key):
+        async def callback(interaction):
+            self.current = key
+            self._build()
+            await interaction.response.edit_message(embed=shop_embed(interaction.guild.id, interaction.user.id, key), view=self)
+        return callback
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ That's someone else's shop window. Open your own with `/shop`.", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        if self.message is not None:
+            try:
+                await self.message.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+
+async def send_shop(interaction, page="home"):
+    view = ShopView(interaction.user.id, page)
+    await interaction.response.send_message(embed=shop_embed(interaction.guild.id, interaction.user.id, page), view=view)
+    view.message = await interaction.original_response()
+
+
+@bot.tree.command(name="shop", description="Open the potato mall: pick a store (weapons, real estate, cars, businesses)")
 @app_commands.guild_only()
-async def shop_cmd(interaction: discord.Interaction, category: str = "all"):
-    await interaction.response.send_message(embed=shop_embed(interaction.guild.id, interaction.user.id, category))
+async def shop_cmd(interaction: discord.Interaction):
+    await send_shop(interaction, "home")
+
+
+@bot.tree.command(name="gunstore", description="Visit the Gun Store: weapons for robbing people")
+@app_commands.guild_only()
+async def gunstore_cmd(interaction: discord.Interaction):
+    await send_shop(interaction, "weapons")
+
+
+@bot.tree.command(name="realestate", description="Visit Real Estate: apartments, houses, penthouses and islands")
+@app_commands.guild_only()
+async def realestate_cmd(interaction: discord.Interaction):
+    await send_shop(interaction, "estate")
+
+
+@bot.tree.command(name="dealership", description="Visit the Dealership: cars, including the Bouncing Maybach")
+@app_commands.guild_only()
+async def dealership_cmd(interaction: discord.Interaction):
+    await send_shop(interaction, "cars")
+
+
+@bot.tree.command(name="businesses", description="Visit the Business Center: laundering fronts and passive income")
+@app_commands.guild_only()
+async def businesses_cmd(interaction: discord.Interaction):
+    await send_shop(interaction, "business")
 
 
 @bot.tree.command(name="buy", description="Buy something from the shop")
